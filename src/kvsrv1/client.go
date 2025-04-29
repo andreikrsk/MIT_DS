@@ -1,7 +1,7 @@
 package kvsrv
 
 import (
-	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
@@ -11,11 +11,10 @@ import (
 type Clerk struct {
 	clnt   *tester.Clnt
 	server string
-	called sync.Map
 }
 
 func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
-	ck := &Clerk{clnt: clnt, server: server, called: sync.Map{}}
+	ck := &Clerk{clnt: clnt, server: server}
 	// You may add code here.
 	return ck
 }
@@ -33,12 +32,11 @@ func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
 	args := rpc.GetArgs{Key: key}
-	reply := rpc.GetReply{}
-	ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)
-	if ok {
-		return reply.Value, reply.Version, reply.Err
-	}
-	return "", 0, rpc.ErrNoKey
+	reply := rpc.GetReply{Value: "", Version: 0, Err: rpc.ErrNoKey}
+	retryCalls(func() bool {
+		return ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)
+	})
+	return reply.Value, reply.Version, reply.Err
 }
 
 // Put updates key with value only if the version in the
@@ -61,17 +59,27 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	args := rpc.PutArgs{Key: key, Value: value, Version: version}
 	reply := rpc.PutReply{}
-	ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
-	if ok {
+	wlost := retryCalls(func() bool {
+		return ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
+	})
+	if wlost {
 		if reply.Err == rpc.ErrVersion {
-			_, loaded := ck.called.LoadOrStore(key, version)
-			if loaded {
-				return rpc.ErrMaybe
-			} else {
-				return rpc.ErrVersion
-			}
+			return rpc.ErrMaybe
+		} else {
+			return rpc.OK
 		}
+	} else {
 		return reply.Err
 	}
-	return rpc.OK
+}
+
+func retryCalls(fn func() bool) bool {
+	wlost := false
+	ok := fn()
+	for !ok {
+		time.Sleep(100 * time.Millisecond)
+		wlost = true
+		ok = fn()
+	}
+	return wlost
 }
