@@ -119,10 +119,26 @@ func trySwitch(ck kvtest.IKVClerk, l string, state string, ver rpc.Tversion) boo
 		return false
 	} else if err == rpc.ErrMaybe {
 		DPrintf("[%s]. Lock version mismatch. But state might be changed.", state)
-		return false
+		return evaluateStateAfterMaybe(ck, l, state)
 	} else {
 		DPrintf("[%s]. State changed.", state)
 		return true
+	}
+}
+
+func evaluateStateAfterMaybe(ck kvtest.IKVClerk, l string, state string) bool {
+	lstate, _, err := ck.Get(l)
+	if err == rpc.ErrNoKey {
+		DPrintf("[%s]. Lock not found. Cannot change state.", state)
+		return false
+	} else {
+		if state == lstate {
+			DPrintf("[%s]. Lock state changed after retries.", state)
+			return true
+		} else {
+			DPrintf("[%s]. Lock state has not been changed", state)
+			return false
+		}
 	}
 }
 
