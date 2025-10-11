@@ -18,15 +18,22 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type valuetuple struct {
+	value   string
+	version rpc.Tversion
+}
 
 type KVServer struct {
 	mu sync.Mutex
-
+	data map[string]valuetuple
 	// Your definitions here.
 }
 
 func MakeKVServer() *KVServer {
-	kv := &KVServer{}
+	kv := &KVServer{
+		mu: sync.Mutex{},
+		data: make(map[string]valuetuple),
+	}
 	// Your code here.
 	return kv
 }
@@ -34,7 +41,17 @@ func MakeKVServer() *KVServer {
 // Get returns the value and version for args.Key, if args.Key
 // exists. Otherwise, Get returns ErrNoKey.
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
-	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	v, ok := kv.data[args.Key]
+	if ok {
+		reply.Value = v.value
+		reply.Version = v.version
+		reply.Err = rpc.OK
+	} else {
+		reply.Err = rpc.ErrNoKey
+	}
 }
 
 // Update the value for a key if args.Version matches the version of
@@ -42,7 +59,29 @@ func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 // If the key doesn't exist, Put installs the value if the
 // args.Version is 0, and returns ErrNoKey otherwise.
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
-	// Your code here.
+	newvalue := valuetuple{
+		value:   args.Value,
+		version: args.Version + 1,
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	v, ok := kv.data[args.Key]
+	if ok {
+		if v.version == args.Version {
+			kv.data[args.Key] = newvalue
+			reply.Err = rpc.OK
+		} else {
+			reply.Err = rpc.ErrVersion
+		}
+	} else {
+		if args.Version == 0 {
+			kv.data[args.Key] = newvalue
+			reply.Err = rpc.OK
+		} else {
+			reply.Err = rpc.ErrNoKey
+		}
+	}
 }
 
 // You can ignore Kill() for this lab
