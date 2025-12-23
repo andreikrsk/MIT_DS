@@ -11,7 +11,7 @@ import (
 
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Test struct {
@@ -269,6 +269,7 @@ func (ts *Test) one(cmd any, expectedServers int, retry bool) int {
 				time.Sleep(20 * time.Millisecond)
 			}
 			if retry == false {
+				fmt.Printf("Leader [%d]\n", index)
 				desp := fmt.Sprintf("agreement of %.8s failed", textcmd)
 				tester.AnnotateCheckerFailure(desp, "failed after submitting command")
 				ts.Fatalf("one(%v) failed to reach agreement", cmd)
