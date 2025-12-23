@@ -9,7 +9,7 @@ import (
 // const hbperiod = 100 * time.Millisecond
 
 // if a follower hasn't heard from a leader in this time, it becomes candidate
-const electionTimeout = 1000 * time.Millisecond
+const electionTimeout = 800
 
 type serverState int
 
@@ -56,6 +56,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 	if args.Term > rf.ps.currentTerm {
 		rf.makeMeFollower(args.Term)
+		rf.persist()
 		DPrintf("[%d, state=%v] became follower for term [%d] due to higher term in RequestVote request from [%d] with term [%d]", rf.me, rf.fstate, rf.ps.currentTerm, args.CandidateId, args.Term)
 	}
 
@@ -64,6 +65,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	// Raft determines which of two logs is more up-to-date
+	// by comparing the index and term of the last entries in the
+	// logs. If the logs have last entries with different terms, then
+	// the log with the later term is more up-to-date. If the logs
+	// end with the same term, then whichever log is longer is
+	// more up-to-date.
 	// 4) check candidate's log up-to-date-ness
 	lastIndex := 0
 	lastTerm := 0
@@ -83,6 +90,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	v := args.CandidateId
 	rf.ps.votedFor = &v
 	reply.VoteGranted = true
+	rf.persist()
 	rf.hbtime.Store(&now)
 	// Your code here (3A, 3B).
 }
@@ -124,15 +132,17 @@ func (rf *Raft) ticker() {
 		// Your code here (3A)
 		// Check if a leader election should be started.
 		rf.mu.Lock()
-		shouldStart := rf.fstate == candidate || (rf.fstate == follower && (rf.hbtime.Load() == nil || time.Since(*rf.hbtime.Load()) > electionTimeout))
+		etms := electionTimeout + (rand.Int63() % 200) // election timeout between 800 and 1000
+		shouldStart := rf.fstate == candidate || (rf.fstate == follower && (rf.hbtime.Load() == nil || time.Since(*rf.hbtime.Load()).Milliseconds() > etms))
 		currentTerm := rf.ps.currentTerm
 		rf.mu.Unlock()
 
 		if shouldStart {
 			rf.mu.Lock()
 			DPrintf("[%d, state=%v] starting election for term [%d]", rf.me, rf.fstate, currentTerm+1)
-			rf.mu.Unlock()
 			rf.makeMeCandidate()
+			rf.persist()
+			rf.mu.Unlock()
 
 			done := make(chan struct{})
 
@@ -142,13 +152,13 @@ func (rf *Raft) ticker() {
 			}()
 
 			<-done
-			rf.mu.Lock()
-			DPrintf("[%d, state=%v] finished election for term [%d]", rf.me, rf.fstate, currentTerm+1)
-			rf.mu.Unlock()
+			// rf.mu.Lock()
+			// DPrintf("[%d, state=%v] finished election for term [%d]", rf.me, rf.fstate, currentTerm+1)
+			// rf.mu.Unlock()
 		}
 
 		if shouldStart {
-			// pause for a random amount of time between 50 and 150
+			// pause for a random amount of time between 50 and 250
 			// milliseconds.
 			ms := 50 + (rand.Int63() % 100)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
@@ -185,30 +195,31 @@ func (rf *Raft) requestForVotes() int {
 			rf.mu.Lock()
 			args := rf.buildRequestVoeteArgs()
 			reply := rf.buildRequestVoteReply()
-			rf.mu.Unlock()
 			DPrintf("[%d, state=%v] is requesting votes from [%d]", rf.me, rf.fstate, sid)
+			rf.mu.Unlock()
 			if ok := rf.sendRequestVote(sid, args, reply); ok {
 				if reply.VoteGranted {
 					granted <- true
-					rf.mu.Lock()
-					DPrintf("[%d, state=%v] received \"vote\" from peer %d for term [%d]", rf.me, rf.fstate, sid, args.Term)
-					rf.mu.Unlock()
+					// rf.mu.Lock()
+					// DPrintf("[%d, state=%v] received \"vote\" from peer %d for term [%d]", rf.me, rf.fstate, sid, args.Term)
+					// rf.mu.Unlock()
 				} else {
-					rf.mu.Lock()
-					DPrintf("[%d, state=%v] received \"no vote\" from peer %d for term %d\n", rf.me, rf.fstate, sid, args.Term)
-					rf.mu.Unlock()
+					// rf.mu.Lock()
+					// DPrintf("[%d, state=%v] received \"no vote\" from peer %d for term %d\n", rf.me, rf.fstate, sid, args.Term)
+					// rf.mu.Unlock()
 				}
 				// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 				rf.mu.Lock()
 				if reply.Term > rf.ps.currentTerm {
 					rf.makeMeFollower(reply.Term)
+					rf.persist()
 					DPrintf("[%d, state=%v] became follower for term [%d] due to higher term in RequestVote reply from [%d] with term [%d]", rf.me, rf.fstate, rf.ps.currentTerm, sid, reply.Term)
 				}
 				rf.mu.Unlock()
 			} else {
-				rf.mu.Lock()
-				DPrintf("[%d, state=%v] failed to send RequestVote RPC to peer [%d] for term [%d]", rf.me, rf.fstate, sid, args.Term)
-				rf.mu.Unlock()
+				// rf.mu.Lock()
+				// DPrintf("[%d, state=%v] failed to send RequestVote RPC to peer [%d] for term [%d]", rf.me, rf.fstate, sid, args.Term)
+				// rf.mu.Unlock()
 			}
 		}(sid)
 	}
@@ -218,7 +229,7 @@ func (rf *Raft) requestForVotes() int {
 		close(granted)
 	}()
 
-	timeout := time.After(time.Duration(float64(electionTimeout) * 0.6)) // or your desired timeout
+	timeout := time.After(rpcTimeout) // or your desired timeout
 	votes := 0
 	for {
 		select {
@@ -229,7 +240,9 @@ func (rf *Raft) requestForVotes() int {
 			}
 			votes++
 		case <-timeout:
-			DPrintf("[%d, state=%v] vote collection timed out", rf.me, rf.fstate)
+			// rf.mu.Lock()
+			// DPrintf("[%d, state=%v] vote collection timed out", rf.me, rf.fstate)
+			// rf.mu.Unlock()
 			return votes
 		}
 	}
@@ -264,24 +277,15 @@ func (rf *Raft) makeMeLeader() {
 	DPrintf("[%d, state=%v] became leader for term [%d]", rf.me, rf.fstate, rf.ps.currentTerm)
 	rf.fstate = leader
 	//When a leader first comes to power, it initializes all nextIndex values to the index just after the last one in its log
+	// and all matchIndex values to zero
 	for i := range len(rf.lvs.nextIndex) {
 		rf.lvs.nextIndex[i] = len(rf.ps.log)
 		rf.lvs.matchIndex[i] = 0
 	}
 	rf.mu.Unlock()
-
-	for sid := range rf.peers {
-		if sid == rf.me {
-			continue
-		}
-		go rf.sendLogEntries(sid)
-	}
 }
 
 func (rf *Raft) makeMeCandidate() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	rf.ps.votedFor = &rf.me
 	rf.ps.currentTerm += 1
 	rf.fstate = candidate
