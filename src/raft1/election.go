@@ -42,7 +42,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("[%d, state=%v] received RequestVote RPC from [%d] for term [%d]", rf.me, rf.fstate, args.CandidateId, args.Term)
+	DPrintf("[server=%d, state=%v, term=%d] received RequestVote RPC from [%d] for term [%d]", rf.me, rf.fstate, rf.ps.currentTerm, args.CandidateId, args.Term)
 	// reply.Term must always be set to currentTerm
 	reply.Term = rf.ps.currentTerm
 	reply.VoteGranted = false
@@ -56,8 +56,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 	if args.Term > rf.ps.currentTerm {
 		rf.makeMeFollower(args.Term)
-		rf.persist()
-		DPrintf("[%d, state=%v] became follower for term [%d] due to higher term in RequestVote request from [%d] with term [%d]", rf.me, rf.fstate, rf.ps.currentTerm, args.CandidateId, args.Term)
+		rf.persist(false)
+		DPrintf("[server=%d, state=%v, term=%d] became follower for term [%d] due to higher term in RequestVote request from [%d] with term [%d]",
+			rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm, args.CandidateId, args.Term)
 	}
 
 	// 3) check whether we already voted for someone else this term
@@ -72,12 +73,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// end with the same term, then whichever log is longer is
 	// more up-to-date.
 	// 4) check candidate's log up-to-date-ness
-	lastIndex := 0
-	lastTerm := 0
-	if len(rf.ps.log) > 0 {
-		lastIndex = len(rf.ps.log) - 1
-		lastTerm = rf.ps.log[lastIndex].Term
-	}
+	lastIndex := rf.lastEntryIndex()
+	lastTerm := rf.lastEntryTerm()
 	candidateUpToDate := (args.LastLogTerm > lastTerm) ||
 		(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex)
 
@@ -90,7 +87,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	v := args.CandidateId
 	rf.ps.votedFor = &v
 	reply.VoteGranted = true
-	rf.persist()
+	rf.persist(false)
 	rf.hbtime.Store(&now)
 	// Your code here (3A, 3B).
 }
@@ -127,7 +124,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) ticker() {
+func (rf *Raft) electionsJob() {
 	for !rf.killed() {
 		// Your code here (3A)
 		// Check if a leader election should be started.
@@ -139,9 +136,9 @@ func (rf *Raft) ticker() {
 
 		if shouldStart {
 			rf.mu.Lock()
-			DPrintf("[%d, state=%v] starting election for term [%d]", rf.me, rf.fstate, currentTerm+1)
+			DPrintf("[server=%d, state=%v, term=%d] starting election for term [%d]", rf.me, rf.fstate, rf.ps.currentTerm, currentTerm+1)
 			rf.makeMeCandidate()
-			rf.persist()
+			rf.persist(false)
 			rf.mu.Unlock()
 
 			done := make(chan struct{})
@@ -173,11 +170,11 @@ func (rf *Raft) runElection() {
 	if rf.ps.votedFor != nil && *rf.ps.votedFor == rf.me {
 		votes += 1
 	}
-	rf.mu.Unlock()
 
 	if votes >= (len(rf.peers)/2)+1 {
 		rf.makeMeLeader()
 	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) requestForVotes() int {
@@ -195,7 +192,7 @@ func (rf *Raft) requestForVotes() int {
 			rf.mu.Lock()
 			args := rf.buildRequestVoeteArgs()
 			reply := rf.buildRequestVoteReply()
-			DPrintf("[%d, state=%v] is requesting votes from [%d]", rf.me, rf.fstate, sid)
+			DPrintf("[server=%d, state=%v, term=%d] is requesting votes from [%d]", rf.me, rf.fstate, rf.ps.currentTerm, sid)
 			rf.mu.Unlock()
 			if ok := rf.sendRequestVote(sid, args, reply); ok {
 				if reply.VoteGranted {
@@ -212,8 +209,8 @@ func (rf *Raft) requestForVotes() int {
 				rf.mu.Lock()
 				if reply.Term > rf.ps.currentTerm {
 					rf.makeMeFollower(reply.Term)
-					rf.persist()
-					DPrintf("[%d, state=%v] became follower for term [%d] due to higher term in RequestVote reply from [%d] with term [%d]", rf.me, rf.fstate, rf.ps.currentTerm, sid, reply.Term)
+					rf.persist(false)
+					DPrintf("[server=%d, state=%v, term=%d] became follower for term [%d] due to higher term in RequestVote reply from [%d] with term [%d]", rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm, sid, reply.Term)
 				}
 				rf.mu.Unlock()
 			} else {
@@ -249,19 +246,11 @@ func (rf *Raft) requestForVotes() int {
 }
 
 func (rf *Raft) buildRequestVoeteArgs() *RequestVoteArgs {
-	llIndex := 0
-	llTerm := 0
-
-	if len(rf.ps.log) > 0 {
-		llIndex = len(rf.ps.log) - 1
-		llTerm = rf.ps.log[llIndex].Term
-	}
-
 	return &RequestVoteArgs{
 		Term:         rf.ps.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: llIndex,
-		LastLogTerm:  llTerm,
+		LastLogIndex: rf.lastEntryIndex(),
+		LastLogTerm:  rf.lastEntryTerm(),
 	}
 }
 
@@ -273,16 +262,16 @@ func (rf *Raft) buildRequestVoteReply() *RequestVoteReply {
 }
 
 func (rf *Raft) makeMeLeader() {
-	rf.mu.Lock()
-	DPrintf("[%d, state=%v] became leader for term [%d]", rf.me, rf.fstate, rf.ps.currentTerm)
+	// rf.mu.Lock()
+	DPrintf("[server=%d, state=%v, term=%d] became leader for term [%d]", rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm)
 	rf.fstate = leader
-	//When a leader first comes to power, it initializes all nextIndex values to the index just after the last one in its log
+	// When a leader first comes to power, it initializes all nextIndex values to the index just after the last one in its log
 	// and all matchIndex values to zero
 	for i := range len(rf.lvs.nextIndex) {
-		rf.lvs.nextIndex[i] = len(rf.ps.log)
+		rf.lvs.nextIndex[i] = rf.firstAfterTheLastLogEntryIndex()
 		rf.lvs.matchIndex[i] = 0
 	}
-	rf.mu.Unlock()
+	// rf.mu.Unlock()
 }
 
 func (rf *Raft) makeMeCandidate() {
@@ -290,7 +279,7 @@ func (rf *Raft) makeMeCandidate() {
 	rf.ps.currentTerm += 1
 	rf.fstate = candidate
 
-	DPrintf("[%d, state=%v] became candidate for term [%d]", rf.me, rf.fstate, rf.ps.currentTerm)
+	DPrintf("[server=%d, state=%v, term=%d] became candidate for term [%d]", rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm)
 }
 
 func (rf *Raft) makeMeFollower(term int) {

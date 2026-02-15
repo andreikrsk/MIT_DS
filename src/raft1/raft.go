@@ -7,15 +7,12 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
-	"bytes"
-
 	"net/http"
 	_ "net/http/pprof"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -23,7 +20,7 @@ import (
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu sync.Mutex // Lock to protect shared access to this peer's state
+	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *tester.Persister   // Object to hold this peer's persisted state
 	applyCh   chan raftapi.ApplyMsg
@@ -43,9 +40,12 @@ type Raft struct {
 
 type PersistentState struct {
 	// each server stores a current term number
-	currentTerm int
-	votedFor    *int
-	log         []*LogEntry
+	currentTerm       int
+	votedFor          *int
+	log               []*LogEntry
+	lastSnapshotIndex int
+	lastSnapshotTerm  int
+	snapshot          []byte
 }
 
 type LogEntry struct {
@@ -72,74 +72,9 @@ type LeaderVolatileState struct {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("[%d, state=%v] GetState called, returning term [%d] and isLeader [%v]", rf.me, rf.fstate, rf.ps.currentTerm, rf.fstate == leader)
+	DPrintf("[server=%d, state=%v, term=%d] GetState called, returning term [%d] and isLeader [%v]",
+		rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm, rf.fstate == leader)
 	return rf.ps.currentTerm, rf.fstate == leader
-}
-
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-// before you've implemented snapshots, you should pass nil as the
-// second argument to persister.Save().
-// after you've implemented snapshots, pass the current snapshot
-// (or nil if there's not yet a snapshot).
-func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.ps.currentTerm)
-	if rf.ps.votedFor == nil {
-		e.Encode(-1)
-	} else {
-		e.Encode(*rf.ps.votedFor)
-	}
-	e.Encode(rf.ps.log)
-	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
-}
-
-// restore previously persisted state.
-func (rf *Raft) readPersist(data []byte) {
-	if len(data) < 1 { // bootstrap without any state?
-		return
-	}
-	// Your code here (3C).
-	// Example:
-	r := bytes.NewBuffer(data)
-	d := labgob.NewDecoder(r)
-	var ct int
-	var vf int
-	var l []*LogEntry
-	if d.Decode(&ct) != nil ||
-		d.Decode(&vf) != nil ||
-		d.Decode(&l) != nil {
-		DPrintf("Error reading persistent state")
-	} else {
-		rf.ps = &PersistentState{
-			currentTerm: ct,
-			log:         l,
-		}
-		if vf != -1 {
-			rf.ps.votedFor = &vf
-		}
-	}
-}
-
-// how many bytes in Raft's persisted log?
-func (rf *Raft) PersistBytes() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.persister.RaftStateSize()
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
-
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -184,19 +119,40 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	rf.readRfState()
+	rf.readSnapshot()
 
 	// Your initialization code here (3A, 3B, 3C).
 	rf.initializePersistentState()
 	rf.initializeVolatileState()
 	rf.initializeLeaderVolatileState(peers)
 
+	if rf.ps.lastSnapshotIndex != -1 && len(rf.ps.snapshot) == 0 {
+		panic("lastSnapshotIndex is not -1, but missing snapshot")
+	}
+
+	if rf.ps.lastSnapshotIndex == -1 && len(rf.ps.snapshot) != 0 {
+		panic("lastSnapshotIndex is -1, but snapshot exists")
+	}
+
+	if rf.ps.snapshot != nil {
+		DPrintf("[server=%d, state=%v, term=%d] on service start applying snapshot with lastSnapshotIndex %d, lastSnapshotTerm %d, snapshot size %d",
+			rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.lastSnapshotIndex, rf.ps.lastSnapshotTerm, len(rf.ps.snapshot))
+		msg := rf.buildApplySnapshotMsg(rf.ps.lastSnapshotIndex, rf.ps.lastSnapshotTerm, rf.ps.snapshot)
+		rf.vs.lastApplied = rf.ps.lastSnapshotIndex
+		rf.vs.commitIndex = rf.ps.lastSnapshotIndex
+
+		go func() {
+			rf.applyCh <- *msg
+		}()
+	}
+
 	go func() {
 		http.ListenAndServe("localhost:6060", nil)
 	}()
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
+	go rf.electionsJob()
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -207,7 +163,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.applyLogToStateMachineJob()
 
 	// rf.mu.Lock()
-	DPrintf("[%d, state=%v] started", rf.me, rf.fstate)
+	DPrintf("[server=%d, state=%v, term=%d] started", rf.me, rf.fstate, rf.ps.currentTerm)
 	// rf.mu.Unlock()
 	return rf
 }
@@ -216,9 +172,12 @@ func (rf *Raft) initializePersistentState() {
 	// the structure is initialized by hand if not state was persisted
 	if rf.ps == nil {
 		rf.ps = &PersistentState{
-			currentTerm: 0,
-			votedFor:    nil,
-			log:         make([]*LogEntry, 0),
+			currentTerm:       0,
+			votedFor:          nil,
+			log:               make([]*LogEntry, 0),
+			lastSnapshotTerm:  -1,
+			lastSnapshotIndex: -1,
+			snapshot:          nil,
 		}
 		rf.ps.log = append(rf.ps.log, &LogEntry{0, nil}) //dummy log entry at index 0
 	}
@@ -235,11 +194,56 @@ func (rf *Raft) initializeLeaderVolatileState(peers []*labrpc.ClientEnd) {
 	nextIndex := make([]int, len(peers))
 	matchIndex := make([]int, len(peers))
 	for i := range peers {
-		nextIndex[i] = len(rf.ps.log) //initialized to leader last log index + 1
-		matchIndex[i] = 0             //initialized to 0, increases monotonically
+		nextIndex[i] = rf.lastEntryIndex() + 1 //initialized to leader last log index + 1
+		matchIndex[i] = 0                      //initialized to 0, increases monotonically
 	}
 	rf.lvs = &LeaderVolatileState{
 		nextIndex:  nextIndex,
 		matchIndex: matchIndex,
 	}
+}
+
+// Index calculation methods
+
+func (rf *Raft) lastEntryTerm() int {
+	llIndex := 0
+	llTerm := 0
+
+	// If log is not empty, it has the most up to date entry
+	if len(rf.ps.log) > 0 {
+		llIndex = len(rf.ps.log) - 1
+		llTerm = rf.ps.log[llIndex].Term
+	} else if rf.ps.lastSnapshotIndex >= 0 {
+		llTerm = rf.ps.lastSnapshotTerm
+	}
+
+	return llTerm
+}
+
+func (rf *Raft) lastEntryIndex() int {
+	return rf.totalEntreisCount() - 1
+}
+
+func (rf *Raft) firstAfterTheLastLogEntryIndex() int {
+	return rf.totalEntreisCount()
+}
+
+func (rf *Raft) trimmedLastApplied() int {
+	return rf.idxShiftedLeftByLastSnapshotIdx(rf.vs.lastApplied)
+}
+
+func (rf *Raft) trimmedCommitIndex() int {
+	return rf.idxShiftedLeftByLastSnapshotIdx(rf.vs.commitIndex)
+}
+
+func (rf *Raft) trimmedNextIndexFor(peer int) int {
+	return rf.idxShiftedLeftByLastSnapshotIdx(rf.lvs.nextIndex[peer])
+}
+
+func (rf *Raft) totalEntreisCount() int {
+	return len(rf.ps.log) + (rf.ps.lastSnapshotIndex + 1) // len of the log + len of the log in the snapshot
+}
+
+func (rf *Raft) idxShiftedLeftByLastSnapshotIdx(index int) int {
+	return index - (rf.ps.lastSnapshotIndex + 1)
 }
