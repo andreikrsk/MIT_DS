@@ -46,7 +46,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// recognizes the leader as legitimate and returns to follower state.
 	if rf.fstate == candidate && args.Term == rf.ps.currentTerm {
 		rf.makeMeFollower(args.Term)
-		rf.persist(false)
+		rf.persist()
 		DPrintf("[server=%d, state=%v, term=%d] became follower from a candidate for the current term due to AppendEntries request from [%d] with term [%d]",
 			rf.me, rf.fstate, rf.ps.currentTerm, args.LeaderId, args.Term)
 	}
@@ -54,7 +54,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 	if args.Term > rf.ps.currentTerm {
 		rf.makeMeFollower(args.Term)
-		rf.persist(false)
+		rf.persist()
 		DPrintf("[server=%d, state=%v, term=%d] became follower for the current term due to higher term in AppendEntries reqest from [%d] with term [%d]",
 			rf.me, rf.fstate, rf.ps.currentTerm, args.LeaderId, args.Term)
 	}
@@ -129,7 +129,7 @@ func (rf *Raft) updateSnapshot(lastIncludedIndex int, lastIncludedTerm int, snap
 	rf.ps.lastSnapshotTerm = lastIncludedTerm
 	rf.storeLogFrom(lastIncludedIndex - rf.ps.lastSnapshotIndex)
 	rf.ps.lastSnapshotIndex = lastIncludedIndex
-	rf.persist(true)
+	rf.persist()
 }
 
 func (rf *Raft) storeLogFrom(index int) {

@@ -55,7 +55,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// recognizes the leader as legitimate and returns to follower state.
 	if rf.fstate == candidate && args.Term == rf.ps.currentTerm {
 		rf.makeMeFollower(args.Term)
-		rf.persist(false)
+		rf.persist()
 		DPrintf("[server=%d, state=%v, term=%d] became follower from a candidate for term [%d] due to AppendEntries request from [%d] with term [%d]",
 			rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm, args.LeaderId, args.Term)
 	}
@@ -63,7 +63,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 	if args.Term > rf.ps.currentTerm {
 		rf.makeMeFollower(args.Term)
-		rf.persist(false)
+		rf.persist()
 		DPrintf("[server=%d, state=%v, term=%d] became follower for term [%d] due to higher term in AppendEntries reqest from [%d] with term [%d]",
 			rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm, args.LeaderId, args.Term)
 	}
@@ -171,7 +171,7 @@ func (rf *Raft) resolveEntriesAppend(args *AppendEntriesArgs) {
 			break
 		}
 	}
-	rf.persist(false)
+	rf.persist()
 	DPrintf("[server=%d, state=%v, term=%d] done appending log entries. Servers' log size [%v]", rf.me, rf.fstate, rf.ps.currentTerm, len(rf.ps.log))
 }
 
@@ -212,7 +212,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.ps.currentTerm,
 		Command: command,
 	})
-	rf.persist(false)
+	rf.persist()
 	commandIdx, term, isLeader = rf.lastEntryIndex(), rf.ps.currentTerm, true
 	DPrintf("[server=%d, state=%v, term=%d] started a new command with command=[%v], commandIdx=[%d], term=[%d], isLeader=[%v]",
 		rf.me, rf.fstate, rf.ps.currentTerm, command, commandIdx, term, isLeader)
@@ -237,7 +237,7 @@ func (rf *Raft) replicateLogJob(server int) {
 func (rf *Raft) sendLogEntries(server int) (sentData bool) {
 	for {
 		rf.mu.Lock()
-		if rf.fstate != leader {
+		if rf.fstate != leader && !rf.killed() {
 			rf.mu.Unlock()
 			return false
 		}
@@ -266,7 +266,7 @@ func (rf *Raft) sendLogEntries(server int) (sentData bool) {
 			rf.mu.Lock()
 			if reply.Term > rf.ps.currentTerm {
 				rf.makeMeFollower(reply.Term)
-				rf.persist(false)
+				rf.persist()
 				DPrintf("[server=%d, state=%v, term=%d] became follower for term [%d] due to higher term in AppendEntries reply from [%d] with term [%d]",
 					rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm, server, reply.Term)
 				rf.mu.Unlock()
@@ -313,7 +313,7 @@ func (rf *Raft) sendLogEntries(server int) (sentData bool) {
 			rf.mu.Lock()
 			if reply.Term > rf.ps.currentTerm {
 				rf.makeMeFollower(reply.Term)
-				rf.persist(false)
+				rf.persist()
 				DPrintf("[server=%d, state=%v, term=%d] became follower for term [%d] due to higher term in AppendEntries reply from [%d] with term [%d]",
 					rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm, server, reply.Term)
 				rf.mu.Unlock()
@@ -557,7 +557,8 @@ func (rf *Raft) applyLogToStateMachineJob() {
 			m := raftapi.ApplyMsg{
 				CommandValid: true,
 				Command:      rf.ps.log[adjLastApplied+1].Command, // the index of the entry to be send is lastApplied + 1
-				CommandIndex: realLastApplied + 1,                 // its real index if no snapshotting happened
+				CommandIndex: realLastApplied + 1,
+				CommandTerm:  rf.ps.log[adjLastApplied+1].Term, // its real index if no snapshotting happened
 			}
 			DPrintf("[server=%d, state=%v, term=%d] sending a msg to the applyChannel. msg={CommandValid [%v], Command [%v], CommandIndex [%v]}",
 				rf.me, rf.fstate, rf.ps.currentTerm, m.CommandValid, m.Command, m.CommandIndex)
@@ -574,6 +575,7 @@ func (rf *Raft) applyLogToStateMachineJob() {
 		// rf.mu.Unlock()
 		time.Sleep(time.Duration(20) * time.Millisecond)
 	}
+	close(rf.applyCh)
 }
 
 // -------------------------------------------------common logic-------------------------------------------------
