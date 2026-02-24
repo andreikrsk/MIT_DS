@@ -56,7 +56,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 	if args.Term > rf.ps.currentTerm {
 		rf.makeMeFollower(args.Term)
-		rf.persist(false)
+		rf.persist()
 		DPrintf("[server=%d, state=%v, term=%d] became follower for term [%d] due to higher term in RequestVote request from [%d] with term [%d]",
 			rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm, args.CandidateId, args.Term)
 	}
@@ -87,8 +87,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	v := args.CandidateId
 	rf.ps.votedFor = &v
 	reply.VoteGranted = true
-	rf.persist(false)
+	rf.persist()
 	rf.hbtime.Store(&now)
+	DPrintf("[server=%d, state=%v, term=%d] granted vote for [%d]",
+		rf.me, rf.fstate, rf.ps.currentTerm, args.CandidateId)
+
 	// Your code here (3A, 3B).
 }
 
@@ -138,7 +141,7 @@ func (rf *Raft) electionsJob() {
 			rf.mu.Lock()
 			DPrintf("[server=%d, state=%v, term=%d] starting election for term [%d]", rf.me, rf.fstate, rf.ps.currentTerm, currentTerm+1)
 			rf.makeMeCandidate()
-			rf.persist(false)
+			rf.persist()
 			rf.mu.Unlock()
 
 			done := make(chan struct{})
@@ -171,7 +174,7 @@ func (rf *Raft) runElection() {
 		votes += 1
 	}
 
-	if votes >= (len(rf.peers)/2)+1 {
+	if votes >= (len(rf.peers)/2)+1 && rf.fstate == candidate {
 		rf.makeMeLeader()
 	}
 	rf.mu.Unlock()
@@ -209,7 +212,7 @@ func (rf *Raft) requestForVotes() int {
 				rf.mu.Lock()
 				if reply.Term > rf.ps.currentTerm {
 					rf.makeMeFollower(reply.Term)
-					rf.persist(false)
+					rf.persist()
 					DPrintf("[server=%d, state=%v, term=%d] became follower for term [%d] due to higher term in RequestVote reply from [%d] with term [%d]", rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm, sid, reply.Term)
 				}
 				rf.mu.Unlock()
@@ -267,11 +270,15 @@ func (rf *Raft) makeMeLeader() {
 	rf.fstate = leader
 	// When a leader first comes to power, it initializes all nextIndex values to the index just after the last one in its log
 	// and all matchIndex values to zero
-	for i := range len(rf.lvs.nextIndex) {
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		// should prevent from starting a new election by a peer when a new leader is elected
+		go rf.sendLogEntries(i)
 		rf.lvs.nextIndex[i] = rf.firstAfterTheLastLogEntryIndex()
 		rf.lvs.matchIndex[i] = 0
 	}
-	// rf.mu.Unlock()
 }
 
 func (rf *Raft) makeMeCandidate() {

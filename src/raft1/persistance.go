@@ -13,7 +13,7 @@ import (
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
-func (rf *Raft) persist(withSnapshot bool) {
+func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
 	w := new(bytes.Buffer)
@@ -34,11 +34,7 @@ func (rf *Raft) persist(withSnapshot bool) {
 	// Use the second argument to persister.Save() to save the snapshot.
 	// If there's no snapshot, pass nil as the second argument.
 
-	// if !withSnapshot {
 	rf.persister.Save(raftstate, rf.ps.snapshot)
-	// } else {
-	// rf.persister.Save(raftstate, nil)
-	// }
 }
 
 // restore previously persisted state.

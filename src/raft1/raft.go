@@ -72,8 +72,8 @@ type LeaderVolatileState struct {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("[server=%d, state=%v, term=%d] GetState called, returning term [%d] and isLeader [%v]",
-		rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm, rf.fstate == leader)
+	// DPrintf("[server=%d, state=%v, term=%d] GetState called, returning term [%d] and isLeader [%v]",
+	// rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm, rf.fstate == leader)
 	return rf.ps.currentTerm, rf.fstate == leader
 }
 
@@ -87,6 +87,9 @@ func (rf *Raft) GetState() (int, bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
+	rf.mu.Lock()
+	DPrintf("[server=%d, state=%v, term=%d] Kill called", rf.me, rf.fstate, rf.ps.currentTerm)
+	rf.mu.Unlock()
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 }
