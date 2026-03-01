@@ -1,22 +1,37 @@
 package kvraft
 
 import (
-	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/tester1"
-)
+	"sync/atomic"
 
+	"6.5840/kvsrv1/rpc"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
+)
 
 type Clerk struct {
 	clnt    *tester.Clnt
 	servers []string
 	// You will have to modify this struct.
+
+	leader atomic.Int32 // the id of the current leader server
 }
 
 func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 	ck := &Clerk{clnt: clnt, servers: servers}
+
 	// You'll have to add code here.
+	ck.leader.Store(0)
 	return ck
+}
+
+func (ck *Clerk) callGet(s int32, args *rpc.GetArgs, reply *rpc.GetReply) (bool, rpc.Err) {
+	ok := ck.clnt.Call(ck.servers[s], "KVServer.Get", args, reply)
+	return ok, reply.Err
+}
+
+func (ck *Clerk) callPut(s int32, args *rpc.PutArgs, reply *rpc.PutReply) (bool, rpc.Err) {
+	ok := ck.clnt.Call(ck.servers[s], "KVServer.Put", args, reply)
+	return ok, reply.Err
 }
 
 // Get fetches the current value and version for a key.  It returns
@@ -30,9 +45,16 @@ func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
+	args := rpc.GetArgs{Key: key}
+	reply := rpc.GetReply{Value: "", Version: 0, Err: rpc.ErrNoKey}
 
-	// You will have to modify this function.
-	return "", 0, ""
+	rpcCaller := func(s int32) (bool, rpc.Err) {
+		return ck.callGet(s, &args, &reply)
+	}
+
+	ck.sendReqToMaster(rpcCaller)
+
+	return reply.Value, reply.Version, reply.Err
 }
 
 // Put updates key with value only if the version in the
@@ -54,5 +76,35 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	return ""
+	args := rpc.PutArgs{Key: key, Value: value, Version: version}
+	reply := rpc.PutReply{Err: rpc.OK}
+
+	rpcCaller := func(s int32) (bool, rpc.Err) {
+		return ck.callPut(s, &args, &reply)
+	}
+
+	ck.sendReqToMaster(rpcCaller)
+
+	return reply.Err
+}
+
+func (ck *Clerk) sendReqToMaster(rpcCaller func(s int32) (bool, rpc.Err)) {
+	// for the first iteration, no failures is expected
+	currentLeader := ck.leader.Load()
+	_, rpcErr := rpcCaller(currentLeader)
+
+	if rpcErr == rpc.ErrWrongLeader {
+		for {
+			for idx := range ck.servers {
+				_, rpcErr := rpcCaller(int32(idx))
+				switch rpcErr {
+				case rpc.OK:
+					ck.leader.CompareAndSwap(currentLeader, int32(idx))
+					return
+				case rpc.ErrVersion:
+					return
+				}
+			}
+		}
+	}
 }
