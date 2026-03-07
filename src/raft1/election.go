@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"math/rand"
 	"sync"
 	"time"
 )
@@ -38,8 +37,6 @@ type RequestVoteReply struct {
 
 // initiated by candidates during elections
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	now := time.Now()
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	DPrintf("[server=%d, state=%v, term=%d] received RequestVote RPC from [%d] for term [%d]", rf.me, rf.fstate, rf.ps.currentTerm, args.CandidateId, args.Term)
@@ -63,6 +60,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// 3) check whether we already voted for someone else this term
 	if rf.ps.votedFor != nil && *rf.ps.votedFor != args.CandidateId {
+		DPrintf("[server=%d, state=%v, term=%d] already voted for [%d] in term [%d]", rf.me, rf.fstate, rf.ps.currentTerm, *rf.ps.votedFor, rf.ps.currentTerm)
 		return
 	}
 
@@ -80,6 +78,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if !candidateUpToDate {
 		// do NOT grant vote if candidate's log is older
+		DPrintf("[server=%d, state=%v, term=%d] candidate's log is not up-to-date", rf.me, rf.fstate, rf.ps.currentTerm)
 		return
 	}
 
@@ -88,7 +87,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.ps.votedFor = &v
 	reply.VoteGranted = true
 	rf.persist()
-	rf.hbtime.Store(&now)
+	rf.registerHb(electionTimeout)
 	DPrintf("[server=%d, state=%v, term=%d] granted vote for [%d]",
 		rf.me, rf.fstate, rf.ps.currentTerm, args.CandidateId)
 
@@ -131,37 +130,28 @@ func (rf *Raft) electionsJob() {
 	for !rf.killed() {
 		// Your code here (3A)
 		// Check if a leader election should be started.
-		rf.mu.Lock()
-		etms := electionTimeout + (rand.Int63() % 200) // election timeout between 800 and 1000
-		shouldStart := rf.fstate == candidate || (rf.fstate == follower && (rf.hbtime.Load() == nil || time.Since(*rf.hbtime.Load()).Milliseconds() > etms))
-		currentTerm := rf.ps.currentTerm
-		rf.mu.Unlock()
-
-		if shouldStart {
+		select {
+		case <-rf.notifyKilledElectionJob:
+			return
+		case <-rf.electionTimer.C:
 			rf.mu.Lock()
-			DPrintf("[server=%d, state=%v, term=%d] starting election for term [%d]", rf.me, rf.fstate, rf.ps.currentTerm, currentTerm+1)
-			rf.makeMeCandidate()
-			rf.persist()
+			state := rf.fstate
+			currentTerm := rf.ps.currentTerm
+
+			if state != leader {
+				DPrintf("[server=%d, state=%v, term=%d] starting election for term [%d]", rf.me, rf.fstate, rf.ps.currentTerm, currentTerm+1)
+				rf.makeMeCandidate()
+				rf.persist()
+			} else {
+				rf.mu.Unlock()
+				continue
+			}
 			rf.mu.Unlock()
+			rf.runElection()
 
-			done := make(chan struct{})
-
-			go func() {
-				rf.runElection()
-				close(done)
-			}()
-
-			<-done
-			// rf.mu.Lock()
-			// DPrintf("[%d, state=%v] finished election for term [%d]", rf.me, rf.fstate, currentTerm+1)
-			// rf.mu.Unlock()
-		}
-
-		if shouldStart {
-			// pause for a random amount of time between 50 and 250
-			// milliseconds.
-			ms := 50 + (rand.Int63() % 100)
-			time.Sleep(time.Duration(ms) * time.Millisecond)
+			rf.mu.Lock()
+			rf.registerHb(150 + (rf.rand.Int() % 300)) // reset election timer after election is done
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -192,11 +182,11 @@ func (rf *Raft) requestForVotes() int {
 		}
 		go func(sid int) {
 			defer wg.Done()
-			rf.mu.Lock()
+			rf.mu.RLock()
 			args := rf.buildRequestVoeteArgs()
 			reply := rf.buildRequestVoteReply()
 			DPrintf("[server=%d, state=%v, term=%d] is requesting votes from [%d]", rf.me, rf.fstate, rf.ps.currentTerm, sid)
-			rf.mu.Unlock()
+			rf.mu.RUnlock()
 			if ok := rf.sendRequestVote(sid, args, reply); ok {
 				if reply.VoteGranted {
 					granted <- true
@@ -263,6 +253,16 @@ func (rf *Raft) buildRequestVoteReply() *RequestVoteReply {
 		VoteGranted: false,
 	}
 }
+func (rf *Raft) registerHb(timeout int) {
+	if !rf.electionTimer.Stop() {
+		select {
+		case <-rf.electionTimer.C:
+		default:
+		}
+	}
+
+	rf.electionTimer.Reset(time.Duration(timeout) * time.Millisecond)
+}
 
 func (rf *Raft) makeMeLeader() {
 	// rf.mu.Lock()
@@ -275,10 +275,11 @@ func (rf *Raft) makeMeLeader() {
 			continue
 		}
 		// should prevent from starting a new election by a peer when a new leader is elected
-		go rf.sendLogEntries(i)
 		rf.lvs.nextIndex[i] = rf.firstAfterTheLastLogEntryIndex()
 		rf.lvs.matchIndex[i] = 0
 	}
+
+	rf.notifyReplication()
 }
 
 func (rf *Raft) makeMeCandidate() {

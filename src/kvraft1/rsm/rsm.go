@@ -2,7 +2,6 @@ package rsm
 
 import (
 	"sync"
-	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
@@ -132,9 +131,6 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 		return rpc.ErrWrongLeader, nil
 	}
 
-	// deadline is needed in case when shutdown happens after the Start() returns,
-	// and the RAFT never commits anything anymore
-	deadline := time.After(5 * time.Second)
 
 	for {
 		select {
@@ -144,8 +140,6 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 			if newTerm > term {
 				return rpc.ErrWrongLeader, nil
 			}
-		case <-deadline:
-			return rpc.ErrWrongLeader, nil
 		}
 	}
 
@@ -195,6 +189,7 @@ func (rsm *RSM) applyChJob() {
 				raft.DPrintf("[server=%d] Received an invalid command, ignoring", rsm.me)
 			}
 		}
+		rsm.notifyTermListeners(lastSeenTerm + 1_000_000) // notify term listeners to unblock all waiting Submit()s
 	}()
 }
 
