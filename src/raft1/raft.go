@@ -7,6 +7,7 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
+	"math/rand"
 	"net/http"
 	_ "net/http/pprof"
 	"sync"
@@ -20,15 +21,28 @@ import (
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *tester.Persister   // Object to hold this peer's persisted state
 	applyCh   chan raftapi.ApplyMsg
 	me        int   // this peer's index into peers[]
 	dead      int32 // set by Kill()
 
-	hbtime atomic.Pointer[time.Time] // last heartbeat time
-	fstate serverState               // state of this peer
+	rand   *rand.Rand
+	fstate serverState // state of this peer
+
+	// election related state
+	electionTimer           *time.Timer
+	notifyKilledElectionJob chan struct{}
+	// replecated the log related state
+	replicateNotifyChMap           map[int]chan struct{} // a channer per server
+	notifyKilledReplicateLogJobMap map[int]chan struct{}
+	// commit related state
+	commitNotifyCh        chan struct{}
+	notifyKilledCommitJob chan struct{}
+	// apply log to state machine related state
+	applyNotifyCh                         chan struct{}
+	notifyKilledApplyLogToStateMachineJob chan struct{}
 
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
@@ -70,8 +84,8 @@ type LeaderVolatileState struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
 	// DPrintf("[server=%d, state=%v, term=%d] GetState called, returning term [%d] and isLeader [%v]",
 	// rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm, rf.fstate == leader)
 	return rf.ps.currentTerm, rf.fstate == leader
@@ -87,11 +101,44 @@ func (rf *Raft) GetState() (int, bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
-	rf.mu.Lock()
+	rf.mu.RLock()
 	DPrintf("[server=%d, state=%v, term=%d] Kill called", rf.me, rf.fstate, rf.ps.currentTerm)
-	rf.mu.Unlock()
+	rf.mu.RUnlock()
 	atomic.StoreInt32(&rf.dead, 1)
+	rf.notifyListenersAboutKilled()
 	// Your code here, if desired.
+}
+
+func (rf *Raft) notifyListenersAboutKilled() {
+	select {
+	case rf.notifyKilledElectionJob <- struct{}{}:
+	default:
+	}
+
+	select {
+	case rf.notifyKilledCommitJob <- struct{}{}:
+	default:
+	}
+
+	select {
+	case rf.notifyKilledApplyLogToStateMachineJob <- struct{}{}:
+	default:
+	}
+
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+
+		rf.mu.RLock()
+		notifyKilledCh := rf.notifyKilledReplicateLogJobMap[peer]
+		rf.mu.RUnlock()
+
+		select {
+		case notifyKilledCh <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (rf *Raft) killed() bool {
@@ -120,6 +167,30 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.fstate = follower //when server starts, it begins as a follower
 	rf.me = me
+
+	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	rf.electionTimer = time.NewTimer(time.Duration(0))
+	rf.notifyKilledElectionJob = make(chan struct{}, 1)
+
+	rf.replicateNotifyChMap = make(map[int]chan struct{})
+	rf.notifyKilledReplicateLogJobMap = make(map[int]chan struct{})
+
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+		rf.replicateNotifyChMap[peer] = make(chan struct{}, 1)
+		rf.notifyKilledReplicateLogJobMap[peer] = make(chan struct{}, 1)
+	}
+
+	rf.commitNotifyCh = make(chan struct{}, 1)
+	rf.commitNotifyCh <- struct{}{}
+	rf.notifyKilledCommitJob = make(chan struct{}, 1)
+
+	rf.applyNotifyCh = make(chan struct{}, 1)
+	rf.applyNotifyCh <- struct{}{}
+	rf.notifyKilledApplyLogToStateMachineJob = make(chan struct{}, 1)
 
 	// initialize from state persisted before a crash
 	rf.readRfState()
@@ -233,10 +304,6 @@ func (rf *Raft) firstAfterTheLastLogEntryIndex() int {
 
 func (rf *Raft) trimmedLastApplied() int {
 	return rf.idxShiftedLeftByLastSnapshotIdx(rf.vs.lastApplied)
-}
-
-func (rf *Raft) trimmedCommitIndex() int {
-	return rf.idxShiftedLeftByLastSnapshotIdx(rf.vs.commitIndex)
 }
 
 func (rf *Raft) trimmedNextIndexFor(peer int) int {

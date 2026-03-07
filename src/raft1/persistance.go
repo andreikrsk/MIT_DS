@@ -80,7 +80,7 @@ func (rf *Raft) readSnapshot() {
 
 // how many bytes in Raft's persisted log?
 func (rf *Raft) PersistBytes() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
 	return rf.persister.RaftStateSize()
 }

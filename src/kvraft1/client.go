@@ -2,6 +2,7 @@ package kvraft
 
 import (
 	"sync/atomic"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
@@ -25,13 +26,37 @@ func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 }
 
 func (ck *Clerk) callGet(s int32, args *rpc.GetArgs, reply *rpc.GetReply) (bool, rpc.Err) {
-	ok := ck.clnt.Call(ck.servers[s], "KVServer.Get", args, reply)
-	return ok, reply.Err
+	deadline := time.After(3 * time.Second)
+	resChan := make(chan bool, 1)
+
+	go func() {
+		ok := ck.clnt.Call(ck.servers[s], "KVServer.Get", args, reply)
+		resChan <- ok
+	}()
+
+	select {
+	case ok := <-resChan:
+		return ok, reply.Err
+	case <-deadline:
+		return false, rpc.Err("RPC timeout")
+	}
 }
 
 func (ck *Clerk) callPut(s int32, args *rpc.PutArgs, reply *rpc.PutReply) (bool, rpc.Err) {
-	ok := ck.clnt.Call(ck.servers[s], "KVServer.Put", args, reply)
-	return ok, reply.Err
+	deadline := time.After(3 * time.Second)
+	resChan := make(chan bool, 1)
+
+	go func() {
+		ok := ck.clnt.Call(ck.servers[s], "KVServer.Put", args, reply)
+		resChan <- ok
+	}()
+
+	select {
+	case ok := <-resChan:
+		return ok, reply.Err
+	case <-deadline:
+		return false, rpc.Err("RPC timeout")
+	}
 }
 
 // Get fetches the current value and version for a key.  It returns
@@ -52,7 +77,11 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 		return ck.callGet(s, &args, &reply)
 	}
 
-	ck.sendReqToMaster(rpcCaller)
+	rpcErr := ck.sendReqToMaster(rpcCaller)
+
+	if rpcErr != rpc.OK {
+		return "", 0, rpcErr
+	}
 
 	return reply.Value, reply.Version, reply.Err
 }
@@ -83,28 +112,54 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		return ck.callPut(s, &args, &reply)
 	}
 
-	ck.sendReqToMaster(rpcCaller)
+	rpcErr := ck.sendReqToMaster(rpcCaller)
+
+	if rpcErr != rpc.OK {
+		return rpcErr
+	}
 
 	return reply.Err
 }
 
-func (ck *Clerk) sendReqToMaster(rpcCaller func(s int32) (bool, rpc.Err)) {
-	// for the first iteration, no failures is expected
-	currentLeader := ck.leader.Load()
-	_, rpcErr := rpcCaller(currentLeader)
+// retry logic
 
-	if rpcErr == rpc.ErrWrongLeader {
+func (ck *Clerk) sendReqToMaster(rpcCaller func(s int32) (bool, rpc.Err)) rpc.Err {
+	currentLeader := ck.leader.Load()
+	ok, rpcErr := rpcCaller(currentLeader)
+
+	hadLostCalls := !ok
+
+	if !ok || rpcErr == rpc.ErrWrongLeader {
 		for {
 			for idx := range ck.servers {
-				_, rpcErr := rpcCaller(int32(idx))
-				switch rpcErr {
-				case rpc.OK:
-					ck.leader.CompareAndSwap(currentLeader, int32(idx))
-					return
-				case rpc.ErrVersion:
-					return
+				ok, rpcErr := rpcCaller(int32(idx))
+
+				if !ok {
+					hadLostCalls = true
+				} else {
+					switch rpcErr {
+					case rpc.OK:
+						ck.leader.CompareAndSwap(currentLeader, int32(idx))
+						return rpc.OK
+					case rpc.ErrVersion:
+						// the first call failed, we don't know if the Put was performed or not, return ErrMaybe
+						ck.leader.CompareAndSwap(currentLeader, int32(idx))
+						if hadLostCalls {
+							return rpc.ErrMaybe
+						}
+						return rpc.ErrVersion
+					case rpc.ErrWrongLeader:
+						// try the next server
+						continue
+					default:
+						// some other error, return it
+						return rpcErr
+					}
 				}
 			}
+			time.Sleep(20 * time.Millisecond)
 		}
 	}
+
+	return rpcErr
 }

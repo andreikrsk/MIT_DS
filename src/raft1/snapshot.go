@@ -1,8 +1,6 @@
 package raft
 
 import (
-	"time"
-
 	"6.5840/raftapi"
 )
 
@@ -27,17 +25,18 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 
 // for a follower to install a snapshot sent by the leader
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	DPrintf("[server=%d, state=%v, term=%d] called InstallSnapshot with LastIncludedIndex %d",
 		rf.me, rf.fstate, rf.ps.currentTerm, args.LastIncludedIndex)
 	// Your code here (3D).
-	now := time.Now()
 
-	rf.mu.Lock()
 	reply.Term = rf.ps.currentTerm
 
 	// if a server receives a request with a stale term number, it rejects the request
 	if args.Term < rf.ps.currentTerm {
-		rf.mu.Unlock()
+		// rf.mu.Unlock()
 		return
 	}
 
@@ -59,13 +58,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			rf.me, rf.fstate, rf.ps.currentTerm, args.LeaderId, args.Term)
 	}
 
-	rf.hbtime.Store(&now)
+	rf.registerHb(electionTimeout)
 
 	if args.LastIncludedIndex <= rf.ps.lastSnapshotIndex {
 		// snapshot is older than existing snapshot. we can move only forward
 		DPrintf("[server=%d, state=%v, term=%d] ignoring InstallSnapshot call with LastIncludedIndex %d because it's <= logOffset %d",
 			rf.me, rf.fstate, rf.ps.currentTerm, args.LastIncludedIndex, rf.ps.lastSnapshotIndex)
-		rf.mu.Unlock()
+		// rf.mu.Unlock()
 		return
 	}
 
@@ -78,11 +77,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	var msg *raftapi.ApplyMsg
 	if args.LastIncludedIndex > rf.vs.lastApplied {
 		rf.vs.lastApplied = args.LastIncludedIndex
-		rf.vs.commitIndex = args.LastIncludedIndex
+		rf.advanceCommitIndex(args.LastIncludedIndex)
 		msg = rf.buildApplySnapshotMsg(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
 		DPrintf("[server=%d, state=%v, term=%d] applying snapshot to state machine with lastIncludedIndex %d",
 			rf.me, rf.fstate, rf.ps.currentTerm, args.LastIncludedIndex)
-		rf.mu.Unlock()
+		// rf.mu.Unlock()
 	}
 
 	if msg != nil {

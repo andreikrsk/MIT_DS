@@ -35,7 +35,6 @@ type AppendEntriesReply struct {
 
 // initiated by leaders to replicate log entries; also used as heartbeat by leader or candidate
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	now := time.Now()
 	// DPrintf("[server=%d, state=%v, term=%d] called the AppendEntries. args={PrevLogIdx=[%d], PrevLogTerm=[%d], EntriesSize=[%d]}, len(log)=[%d]",
 	// rf.me, rf.fstate, rf.ps.currentTerm, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), len(rf.ps.log))
 
@@ -75,7 +74,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	case candidate:
 		//TODO: what should be done here?
 	case follower:
-		rf.hbtime.Store(&now)
+		rf.registerHb(electionTimeout)
 
 		// the entries are coming should be based on the log entries
 		if args.PrevLogIndex > rf.ps.lastSnapshotIndex {
@@ -125,7 +124,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		//If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 		if args.LeaderCommit > rf.vs.commitIndex {
-			rf.vs.commitIndex = min(args.LeaderCommit, rf.lastEntryIndex())
+			newCommitIdx := min(args.LeaderCommit, rf.lastEntryIndex())
+			if newCommitIdx > rf.vs.commitIndex {
+				rf.advanceCommitIndex(newCommitIdx)
+			}
 			DPrintf("[server=%d, state=%v, term=%d] updating commit index to [%d], last applied index is [%d]", rf.me, rf.fstate, rf.ps.currentTerm, rf.vs.commitIndex, rf.vs.lastApplied)
 		}
 
@@ -213,6 +215,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	})
 	rf.persist()
+
+	rf.notifyReplication()
+
 	commandIdx, term, isLeader = rf.lastEntryIndex(), rf.ps.currentTerm, true
 	DPrintf("[server=%d, state=%v, term=%d] started a new command with command=[%v], commandIdx=[%d], term=[%d], isLeader=[%v]",
 		rf.me, rf.fstate, rf.ps.currentTerm, command, commandIdx, term, isLeader)
@@ -224,32 +229,45 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (rf *Raft) replicateLogJob(server int) {
-	backoffBase := 100 * time.Millisecond
+	hbTimeout := 100 * time.Millisecond
+	hbTimer := time.NewTimer(hbTimeout)
+	defer hbTimer.Stop()
 
-	for !rf.killed() {
-		sentEntries := rf.sendLogEntries(server)
-		if !sentEntries {
-			time.Sleep(backoffBase)
+	rf.mu.RLock()
+	replicationCh := rf.replicateNotifyChMap[server]
+	notifyKilledCh := rf.notifyKilledReplicateLogJobMap[server]
+	rf.mu.RUnlock()
+
+	for {
+		select {
+		case <-replicationCh:
+			rf.sendLogEntries(server)
+			hbTimer.Reset(hbTimeout)
+		case <-hbTimer.C:
+			rf.sendLogEntries(server)
+			hbTimer.Reset(hbTimeout)
+		case <-notifyKilledCh:
+			return
 		}
 	}
 }
 
-func (rf *Raft) sendLogEntries(server int) (sentData bool) {
+func (rf *Raft) sendLogEntries(server int) {
 	for {
-		rf.mu.Lock()
-		if rf.fstate != leader && !rf.killed() {
-			rf.mu.Unlock()
-			return false
+		rf.mu.RLock()
+		if rf.fstate != leader {
+			rf.mu.RUnlock()
+			return
 		}
+
 		if rf.shouldSendLog(server) {
 			args := rf.buildAppendEntriesArgs(server)
 			reply := rf.buildAppendEntriesReply()
 			// if len(args.Entries) != 0 {
 			// DPrintf("[%d, state=%v] calling the sendLogEntries for server [%d]", rf.me, rf.fstate, server)
 			// }
-			sentData = sentData || len(args.Entries) > 0
 
-			rf.mu.Unlock()
+			rf.mu.RUnlock()
 
 			ok := rf.sendAppendEntriesWithTimeout(server, args, reply)
 			// if RPC didn't return (network lost), retry until deadline
@@ -270,13 +288,13 @@ func (rf *Raft) sendLogEntries(server int) (sentData bool) {
 				DPrintf("[server=%d, state=%v, term=%d] became follower for term [%d] due to higher term in AppendEntries reply from [%d] with term [%d]",
 					rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm, server, reply.Term)
 				rf.mu.Unlock()
-				return sentData
+				return
 			}
 
 			if reply.Term < rf.ps.currentTerm || rf.fstate != leader {
 				// stale reply, ignore
 				rf.mu.Unlock()
-				return sentData
+				return
 			}
 
 			// If successful: update nextIndex and matchIndex for follower
@@ -287,10 +305,9 @@ func (rf *Raft) sendLogEntries(server int) (sentData bool) {
 					DPrintf("[server=%d, state=%v, term=%d] success sending log entries to server [%d]. Updated nextIndex from [%d] to [%d], matchIndex from [%d] to [%d]",
 						rf.me, rf.fstate, rf.ps.currentTerm, server, rf.lvs.nextIndex[server], newMatch+1, rf.lvs.matchIndex[server], newMatch)
 				}
-				rf.lvs.matchIndex[server] = newMatch
-				rf.lvs.nextIndex[server] = newMatch + 1
+				rf.advanceMatchAndNextIndex(server, newMatch)
 				rf.mu.Unlock()
-				return sentData
+				return
 			}
 
 			rf.updateFollowersNextIndex(server, reply)
@@ -299,7 +316,7 @@ func (rf *Raft) sendLogEntries(server int) (sentData bool) {
 			reply := rf.buildInstallSnapshotReply()
 			DPrintf("[server=%d, state=%v, term=%d] calling the sendInstallSnapshot for server [%d]", rf.me, rf.fstate, rf.ps.currentTerm, server)
 
-			rf.mu.Unlock()
+			rf.mu.RUnlock()
 
 			ok := rf.sendInstallSnapshotWithTimeout(server, args, reply)
 			// if RPC didn't return (network lost), retry until deadline
@@ -317,22 +334,54 @@ func (rf *Raft) sendLogEntries(server int) (sentData bool) {
 				DPrintf("[server=%d, state=%v, term=%d] became follower for term [%d] due to higher term in AppendEntries reply from [%d] with term [%d]",
 					rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.currentTerm, server, reply.Term)
 				rf.mu.Unlock()
-				return true
+				return
 			}
 
 			if reply.Term < rf.ps.currentTerm || rf.fstate != leader {
 				// stale reply, ignore
 				rf.mu.Unlock()
-				return true
+				return
 			}
 
-			rf.lvs.matchIndex[server] = args.LastIncludedIndex
-			rf.lvs.nextIndex[server] = rf.lvs.matchIndex[server] + 1
+			rf.advanceMatchAndNextIndex(server, args.LastIncludedIndex)
+
 			rf.mu.Unlock()
-			return true
+			return
 
 		}
 		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) notifyReplication() {
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+
+		select {
+		case rf.replicateNotifyChMap[peer] <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (rf *Raft) advanceMatchAndNextIndex(server int, newMatch int) {
+	rf.lvs.matchIndex[server] = newMatch
+	rf.lvs.nextIndex[server] = rf.lvs.matchIndex[server] + 1
+
+	select {
+	case rf.commitNotifyCh <- struct{}{}:
+	default:
+	}
+}
+
+func (rf *Raft) advanceCommitIndex(newIndex int) {
+	rf.vs.commitIndex = newIndex
+
+	select {
+	case rf.applyNotifyCh <- struct{}{}:
+	default:
 	}
 }
 
@@ -371,8 +420,6 @@ func (rf *Raft) lastIndexOfTerm(term int) int {
 	return 0
 }
 
-// can be further optimized by first sending a single entry. find agreement point, only after that send the rest of the log
-// as the current approach works in O(len(log)^2) time
 func (rf *Raft) sendAppendEntriesWithTimeout(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	done := make(chan bool, 1)
 	go func() {
@@ -387,9 +434,9 @@ func (rf *Raft) sendAppendEntriesWithTimeout(server int, args *AppendEntriesArgs
 	case ok := <-done:
 		return ok
 	case <-timer.C:
-		rf.mu.Lock()
+		// rf.mu.Lock()
 		// DPrintf("[server=%d, state=%v, term=%d] append entries to [%d] timed out", rf.me, rf.fstate, rf.ps.currentTerm, server)
-		rf.mu.Unlock()
+		// rf.mu.Unlock()
 		return false
 	}
 }
@@ -408,9 +455,9 @@ func (rf *Raft) sendInstallSnapshotWithTimeout(server int, args *InstallSnapshot
 	case ok := <-done:
 		return ok
 	case <-timer.C:
-		rf.mu.Lock()
+		// rf.mu.Lock()
 		// DPrintf("[server=%d, state=%v, term=%d] append entries to [%d] timed out", rf.me, rf.fstate, rf.ps.currentTerm, server)
-		rf.mu.Unlock()
+		// rf.mu.Unlock()
 		return false
 	}
 }
@@ -491,48 +538,53 @@ func (rf *Raft) buildInstallSnapshotReply() *InstallSnapshotReply {
 }
 
 func (rf *Raft) commitJob() {
-	for !rf.killed() {
-		rf.mu.Lock()
-		if rf.fstate != leader {
-			rf.mu.Unlock()
-			time.Sleep(20 * time.Millisecond)
+	for {
+		select {
+		case <-rf.commitNotifyCh:
+			rf.doCommit()
+		case <-rf.notifyKilledCommitJob:
+			return
+		}
+	}
+}
+
+func (rf *Raft) doCommit() {
+	// Raft never commits log entries from previous terms by counting replicas. Only log entries from the leader’s current
+	// term are committed by counting replicas;
+	// adjCommitIdx := rf.trimmedCommitIndex()
+
+	expectedMatches := (len(rf.peers) / 2) + 1 // number of servers needed for majority
+
+	topMatchIdx := make([]int, 0, len(rf.peers))                // holds all the match indexes, sorted in desc order
+	topMatchIdx = append(topMatchIdx, rf.totalEntreisCount()-1) // leader itself
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for sid := range rf.peers {
+		if sid == rf.me {
 			continue
 		}
+		topMatchIdx = append(topMatchIdx, rf.lvs.matchIndex[sid])
+	}
+	slices.Sort(topMatchIdx)
+	slices.Reverse(topMatchIdx)
 
-		// Raft never commits log entries from previous terms by counting replicas. Only log entries from the leader’s current
-		// term are committed by counting replicas;
-		// adjCommitIdx := rf.trimmedCommitIndex()
-		expectedMatches := (len(rf.peers) / 2) + 1 // number of servers needed for majority
+	lowestMatchIdx := topMatchIdx[expectedMatches-1] // the lowest match index among the top majority
+	adjLowestMathcIdx := rf.idxShiftedLeftByLastSnapshotIdx(lowestMatchIdx)
 
-		topMatchIdx := make([]int, 0, len(rf.peers))                // holds all the match indexes, sorted in desc order
-		topMatchIdx = append(topMatchIdx, rf.totalEntreisCount()-1) // leader itself
-		for sid := range rf.peers {
-			if sid == rf.me {
-				continue
-			}
-			topMatchIdx = append(topMatchIdx, rf.lvs.matchIndex[sid])
-		}
-		slices.Sort(topMatchIdx)
-		slices.Reverse(topMatchIdx)
+	if adjLowestMathcIdx == len(rf.ps.log) || adjLowestMathcIdx < 0 {
+		DPrintf("[server=%d, state=%v, term=%d] topMatchIdx=[%v], lowestMatchIdx=[%d], adjustedLowestMatchIdx=[%d], log size=[%d], lastSnapshotIndex=[%d]",
+			rf.me, rf.fstate, rf.ps.currentTerm, topMatchIdx, lowestMatchIdx, adjLowestMathcIdx, len(rf.ps.log), rf.ps.lastSnapshotIndex)
+	}
 
-		lowestMatchIdx := topMatchIdx[expectedMatches-1] // the lowest match index among the top majority
-		adjLowestMathcIdx := rf.idxShiftedLeftByLastSnapshotIdx(lowestMatchIdx)
+	isTheLowesMatchInTheCurrentTerm := (lowestMatchIdx == rf.ps.lastSnapshotIndex && rf.ps.lastSnapshotTerm == rf.ps.currentTerm) ||
+		(adjLowestMathcIdx >= 0 && rf.ps.log[adjLowestMathcIdx].Term == rf.ps.currentTerm)
 
-		if adjLowestMathcIdx == len(rf.ps.log) || adjLowestMathcIdx < 0 {
-			DPrintf("[server=%d, state=%v, term=%d] topMatchIdx=[%v], lowestMatchIdx=[%d], adjustedLowestMatchIdx=[%d], log size=[%d], lastSnapshotIndex=[%d]",
-				rf.me, rf.fstate, rf.ps.currentTerm, topMatchIdx, lowestMatchIdx, adjLowestMathcIdx, len(rf.ps.log), rf.ps.lastSnapshotIndex)
-		}
-
-		isTheLowesMatchInTheCurrentTerm := (lowestMatchIdx == rf.ps.lastSnapshotIndex && rf.ps.lastSnapshotTerm == rf.ps.currentTerm) ||
-			(adjLowestMathcIdx >= 0 && rf.ps.log[adjLowestMathcIdx].Term == rf.ps.currentTerm)
-
-		if lowestMatchIdx > rf.vs.commitIndex && isTheLowesMatchInTheCurrentTerm {
-			rf.vs.commitIndex = lowestMatchIdx
-			DPrintf("[server=%d, state=%v, term=%d] commitIndex updated to [%d], last applied index [%d]",
-				rf.me, rf.fstate, rf.ps.currentTerm, rf.vs.commitIndex, rf.vs.lastApplied)
-		}
-
-		rf.mu.Unlock()
+	if lowestMatchIdx > rf.vs.commitIndex && isTheLowesMatchInTheCurrentTerm {
+		rf.advanceCommitIndex(lowestMatchIdx)
+		DPrintf("[server=%d, state=%v, term=%d] commitIndex updated to [%d], last applied index [%d]",
+			rf.me, rf.fstate, rf.ps.currentTerm, rf.vs.commitIndex, rf.vs.lastApplied)
 	}
 }
 
@@ -540,42 +592,50 @@ func (rf *Raft) commitJob() {
 
 // ++++++++++++++++++++++++++++++++++++++++++++++++common logic++++++++++++++++++++++++++++++++++++++++++++++++
 func (rf *Raft) applyLogToStateMachineJob() {
-	for !rf.killed() {
-		// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine
-		for {
-			rf.mu.Lock()
-			if rf.vs.commitIndex <= rf.vs.lastApplied {
-				rf.mu.Unlock()
-				break
-			}
-			realLastApplied := rf.vs.lastApplied
-			adjLastApplied := rf.trimmedLastApplied()
+	defer close(rf.applyCh)
 
-			DPrintf("[server=%d, state=%v, term=%d] trying to send a command from apply job. commitIndex=[%d], realLastApplied=[%d], adjLastApplied=[%d], log size=[%d]",
-				rf.me, rf.fstate, rf.ps.currentTerm, rf.vs.commitIndex, rf.vs.lastApplied, adjLastApplied, len(rf.ps.log))
-
-			m := raftapi.ApplyMsg{
-				CommandValid: true,
-				Command:      rf.ps.log[adjLastApplied+1].Command, // the index of the entry to be send is lastApplied + 1
-				CommandIndex: realLastApplied + 1,
-				CommandTerm:  rf.ps.log[adjLastApplied+1].Term, // its real index if no snapshotting happened
-			}
-			DPrintf("[server=%d, state=%v, term=%d] sending a msg to the applyChannel. msg={CommandValid [%v], Command [%v], CommandIndex [%v]}",
-				rf.me, rf.fstate, rf.ps.currentTerm, m.CommandValid, m.Command, m.CommandIndex)
-			rf.mu.Unlock()
-
-			rf.applyCh <- m
-
-			rf.mu.Lock()
-			rf.vs.lastApplied++
-			DPrintf("[server=%d, state=%v, term=%d] sent a msg to the applyChannel. msg={CommandValid [%v], Command [%v], CommandIndex [%v]}",
-				rf.me, rf.fstate, rf.ps.currentTerm, m.CommandValid, m.Command, m.CommandIndex)
-			rf.mu.Unlock()
+	for {
+		select {
+		case <-rf.applyNotifyCh:
+			rf.doApply()
+		case <-rf.notifyKilledApplyLogToStateMachineJob:
+			return
 		}
-		// rf.mu.Unlock()
-		time.Sleep(time.Duration(20) * time.Millisecond)
 	}
-	close(rf.applyCh)
+}
+
+func (rf *Raft) doApply() {
+	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine
+	for {
+		rf.mu.RLock()
+		if rf.vs.commitIndex <= rf.vs.lastApplied {
+			rf.mu.RUnlock()
+			return
+		}
+		realLastApplied := rf.vs.lastApplied
+		adjLastApplied := rf.trimmedLastApplied()
+
+		DPrintf("[server=%d, state=%v, term=%d] trying to send a command from apply job. commitIndex=[%d], realLastApplied=[%d], adjLastApplied=[%d], log size=[%d]",
+			rf.me, rf.fstate, rf.ps.currentTerm, rf.vs.commitIndex, rf.vs.lastApplied, adjLastApplied, len(rf.ps.log))
+
+		m := raftapi.ApplyMsg{
+			CommandValid: true,
+			Command:      rf.ps.log[adjLastApplied+1].Command, // the index of the entry to be send is lastApplied + 1
+			CommandIndex: realLastApplied + 1,
+			CommandTerm:  rf.ps.log[adjLastApplied+1].Term, // its real index if no snapshotting happened
+		}
+		DPrintf("[server=%d, state=%v, term=%d] sending a msg to the applyChannel. msg={CommandValid [%v], Command [%v], CommandIndex [%v]}",
+			rf.me, rf.fstate, rf.ps.currentTerm, m.CommandValid, m.Command, m.CommandIndex)
+		rf.mu.RUnlock()
+
+		rf.applyCh <- m
+
+		rf.mu.Lock()
+		rf.vs.lastApplied++
+		DPrintf("[server=%d, state=%v, term=%d] sent a msg to the applyChannel. msg={CommandValid [%v], Command [%v], CommandIndex [%v]}",
+			rf.me, rf.fstate, rf.ps.currentTerm, m.CommandValid, m.Command, m.CommandIndex)
+		rf.mu.Unlock()
+	}
 }
 
 // -------------------------------------------------common logic-------------------------------------------------
