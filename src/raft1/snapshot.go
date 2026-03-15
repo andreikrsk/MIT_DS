@@ -1,9 +1,5 @@
 package raft
 
-import (
-	"6.5840/raftapi"
-)
-
 type InstallSnapshotArgs struct {
 	Term              int    // leader's term
 	LeaderId          int    // so follower can redirect clients
@@ -58,8 +54,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			rf.me, rf.fstate, rf.ps.currentTerm, args.LeaderId, args.Term)
 	}
 
-	rf.registerHb(electionTimeout)
-
 	if args.LastIncludedIndex <= rf.ps.lastSnapshotIndex {
 		// snapshot is older than existing snapshot. we can move only forward
 		DPrintf("[server=%d, state=%v, term=%d] ignoring InstallSnapshot call with LastIncludedIndex %d because it's <= logOffset %d",
@@ -74,32 +68,16 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.updateSnapshot(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
 	// send the snapshot to the service (e.g., a key/value server) if the index > lastApplied
 
-	var msg *raftapi.ApplyMsg
+	// var msg *raftapi.ApplyMsg
 	if args.LastIncludedIndex > rf.vs.lastApplied {
-		rf.vs.lastApplied = args.LastIncludedIndex
+		rf.vs.lastApplied = args.LastIncludedIndex - 1
 		rf.advanceCommitIndex(args.LastIncludedIndex)
-		msg = rf.buildApplySnapshotMsg(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
+		// msg = rf.buildApplySnapshotMsg(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
 		DPrintf("[server=%d, state=%v, term=%d] applying snapshot to state machine with lastIncludedIndex %d",
 			rf.me, rf.fstate, rf.ps.currentTerm, args.LastIncludedIndex)
 		// rf.mu.Unlock()
 	}
 
-	if msg != nil {
-		rf.applyCh <- *msg
-	}
-}
-
-func (rf *Raft) buildApplySnapshotMsg(lastIncludedIndex int, lastIncludedTerm int, snapshot []byte) *raftapi.ApplyMsg {
-	var msg *raftapi.ApplyMsg
-
-	msg = &raftapi.ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      snapshot,
-		SnapshotTerm:  lastIncludedTerm,
-		SnapshotIndex: lastIncludedIndex,
-	}
-
-	return msg
 }
 
 // the service says it has created a snapshot that has
