@@ -87,7 +87,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.ps.votedFor = &v
 	reply.VoteGranted = true
 	rf.persist()
-	rf.registerHb(electionTimeout)
 	DPrintf("[server=%d, state=%v, term=%d] granted vote for [%d]",
 		rf.me, rf.fstate, rf.ps.currentTerm, args.CandidateId)
 
@@ -146,12 +145,9 @@ func (rf *Raft) electionsJob() {
 				rf.mu.Unlock()
 				continue
 			}
+			rf.registerHb(electionTimeout)
 			rf.mu.Unlock()
 			rf.runElection()
-
-			rf.mu.Lock()
-			rf.registerHb(150 + (rf.rand.Int() % 300)) // reset election timer after election is done
-			rf.mu.Unlock()
 		}
 	}
 }
@@ -261,7 +257,7 @@ func (rf *Raft) registerHb(timeout int) {
 		}
 	}
 
-	rf.electionTimer.Reset(time.Duration(timeout) * time.Millisecond)
+	rf.electionTimer.Reset(time.Duration(timeout+(rf.rand.Int()%400)) * time.Millisecond)
 }
 
 func (rf *Raft) makeMeLeader() {
@@ -294,4 +290,5 @@ func (rf *Raft) makeMeFollower(term int) {
 	rf.ps.currentTerm = term
 	rf.ps.votedFor = nil
 	rf.fstate = follower
+	rf.registerHb(electionTimeout)
 }

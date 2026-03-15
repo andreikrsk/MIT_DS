@@ -7,7 +7,7 @@ import (
 	"6.5840/raftapi"
 )
 
-const rpcTimeout = 50 * time.Millisecond
+const rpcTimeout = 700 * time.Millisecond
 
 type AppendEntriesArgs struct {
 	Term         int
@@ -618,11 +618,25 @@ func (rf *Raft) doApply() {
 		DPrintf("[server=%d, state=%v, term=%d] trying to send a command from apply job. commitIndex=[%d], realLastApplied=[%d], adjLastApplied=[%d], log size=[%d]",
 			rf.me, rf.fstate, rf.ps.currentTerm, rf.vs.commitIndex, rf.vs.lastApplied, adjLastApplied, len(rf.ps.log))
 
-		m := raftapi.ApplyMsg{
-			CommandValid: true,
-			Command:      rf.ps.log[adjLastApplied+1].Command, // the index of the entry to be send is lastApplied + 1
-			CommandIndex: realLastApplied + 1,
-			CommandTerm:  rf.ps.log[adjLastApplied+1].Term, // its real index if no snapshotting happened
+		var m raftapi.ApplyMsg
+		if realLastApplied == rf.ps.lastSnapshotIndex-1 {
+			m = raftapi.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      rf.ps.snapshot,
+				SnapshotTerm:  rf.ps.lastSnapshotTerm,
+				SnapshotIndex: rf.ps.lastSnapshotIndex,
+
+				CommandValid: false,
+			}
+		} else {
+			m = raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.ps.log[adjLastApplied+1].Command, // the index of the entry to be send is lastApplied + 1
+				CommandIndex: realLastApplied + 1,
+				CommandTerm:  rf.ps.log[adjLastApplied+1].Term, // its real index if no snapshotting happened
+
+				SnapshotValid: false,
+			}
 		}
 		DPrintf("[server=%d, state=%v, term=%d] sending a msg to the applyChannel. msg={CommandValid [%v], Command [%v], CommandIndex [%v]}",
 			rf.me, rf.fstate, rf.ps.currentTerm, m.CommandValid, m.Command, m.CommandIndex)

@@ -49,6 +49,7 @@ type RSM struct {
 	applyCh      chan raftapi.ApplyMsg
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
+	persister    *tester.Persister
 	// Your definitions here.
 	waitingOpsChs       map[uuid.UUID]chan any // maps opId and the channel to send the applied command to the waiting thread in Submit() method, for correlation
 	termChangeListeners map[uuid.UUID]chan int
@@ -76,6 +77,7 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate:        maxraftstate,
 		applyCh:             make(chan raftapi.ApplyMsg),
 		sm:                  sm,
+		persister:           persister,
 		waitingOpsChs:       make(map[uuid.UUID]chan any),
 		lastAppliedIndex:    -1,
 		termChangeListeners: make(map[uuid.UUID]chan int),
@@ -131,7 +133,6 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 		return rpc.ErrWrongLeader, nil
 	}
 
-
 	for {
 		select {
 		case res := <-resChan:
@@ -151,46 +152,72 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 func (rsm *RSM) applyChJob() {
 	lastSeenTerm := -1
 	go func() {
+		snap := rsm.persister.ReadSnapshot()
+		if len(snap) > 0 {
+			rsm.sm.Restore(snap)
+		}
+
 		for msg := range rsm.applyCh {
 			if msg.CommandValid {
 				if msg.CommandTerm != lastSeenTerm {
 					rsm.notifyTermListeners(msg.CommandTerm)
 					lastSeenTerm = msg.CommandTerm
 				}
-
-				// execute the command on the state machine
-				raft.DPrintf("[server=%d] Executing the commited command with id %d on the state machine from doOpsJob()", rsm.me, msg.Command.(Op).Key)
-				if msg.CommandIndex <= rsm.lastAppliedIndex {
-					raft.DPrintf("[server=%d] Command with id %d has already been applied, skipping", rsm.me, msg.Command.(Op).Key)
-					continue
-				} else {
-					rsm.lastAppliedIndex = msg.CommandIndex
+				rsm.handlePlainMessage(msg)
+			} else if msg.SnapshotValid {
+				if msg.SnapshotTerm != lastSeenTerm {
+					rsm.notifyTermListeners(msg.SnapshotTerm)
+					lastSeenTerm = msg.SnapshotTerm
 				}
-
-				// i have to always do the Op if it was commited by the Raft
-				rep := rsm.sm.DoOp(msg.Command.(Op).Req)
-				key := msg.Command.(Op).Key
-
-				rsm.mu.Lock()
-				ch, ok := rsm.waitingOpsChs[key]
-				if ok {
-					delete(rsm.waitingOpsChs, key)
-				}
-				rsm.mu.Unlock()
-
-				if ok {
-					// non-blocking send is even safer:
-					select {
-					case ch <- rep:
-					default:
-					}
-				}
+				rsm.handleSnapshotMessage(msg)
 			} else {
 				raft.DPrintf("[server=%d] Received an invalid command, ignoring", rsm.me)
 			}
 		}
 		rsm.notifyTermListeners(lastSeenTerm + 1_000_000) // notify term listeners to unblock all waiting Submit()s
 	}()
+}
+
+func (rsm *RSM) handlePlainMessage(msg raftapi.ApplyMsg) {
+	stateSize := rsm.rf.PersistBytes()
+	// the snapshot should be taken if the state size exceeds the maxraftstate
+	if rsm.maxraftstate != -1 && stateSize >= rsm.maxraftstate {
+		rsm.sm.Snapshot()
+		rsm.rf.Snapshot(rsm.lastAppliedIndex, rsm.sm.Snapshot())
+	}
+
+	// execute the command on the state machine
+	raft.DPrintf("[server=%d] Executing the commited command with id %d on the state machine from doOpsJob()", rsm.me, msg.Command.(Op).Key)
+	if msg.CommandIndex <= rsm.lastAppliedIndex {
+		raft.DPrintf("[server=%d] Command with id %d has already been applied, skipping", rsm.me, msg.Command.(Op).Key)
+		return
+	} else {
+		rsm.lastAppliedIndex = msg.CommandIndex
+	}
+
+	// i have to always do the Op if it was commited by the Raft
+	rep := rsm.sm.DoOp(msg.Command.(Op).Req)
+	key := msg.Command.(Op).Key
+
+	rsm.mu.Lock()
+	ch, ok := rsm.waitingOpsChs[key]
+	if ok {
+		delete(rsm.waitingOpsChs, key)
+	}
+	rsm.mu.Unlock()
+
+	if ok {
+		// non-blocking send is even safer:
+		select {
+		case ch <- rep:
+		default:
+		}
+	}
+}
+
+func (rsm *RSM) handleSnapshotMessage(msg raftapi.ApplyMsg) {
+	rsm.sm.Restore(msg.Snapshot)
+	rsm.lastAppliedIndex = msg.SnapshotIndex
 }
 
 func (rsm *RSM) notifyTermListeners(term int) {

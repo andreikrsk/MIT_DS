@@ -212,13 +212,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	if rf.ps.snapshot != nil {
 		DPrintf("[server=%d, state=%v, term=%d] on service start applying snapshot with lastSnapshotIndex %d, lastSnapshotTerm %d, snapshot size %d",
 			rf.me, rf.fstate, rf.ps.currentTerm, rf.ps.lastSnapshotIndex, rf.ps.lastSnapshotTerm, len(rf.ps.snapshot))
-		msg := rf.buildApplySnapshotMsg(rf.ps.lastSnapshotIndex, rf.ps.lastSnapshotTerm, rf.ps.snapshot)
-		rf.vs.lastApplied = rf.ps.lastSnapshotIndex
-		rf.vs.commitIndex = rf.ps.lastSnapshotIndex
-
-		go func() {
-			rf.applyCh <- *msg
-		}()
+		rf.vs.lastApplied = rf.ps.lastSnapshotIndex - 1
+		rf.advanceCommitIndex(rf.ps.lastSnapshotIndex)
 	}
 
 	go func() {
