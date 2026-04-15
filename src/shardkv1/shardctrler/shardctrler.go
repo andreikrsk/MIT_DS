@@ -5,13 +5,16 @@ package shardctrler
 //
 
 import (
-
-	"6.5840/kvsrv1"
-	"6.5840/kvtest1"
+	kvsrv "6.5840/kvsrv1"
+	"6.5840/kvsrv1/rpc"
+	kvtest "6.5840/kvtest1"
 	"6.5840/shardkv1/shardcfg"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
+const (
+	configKey = "config"
+)
 
 // ShardCtrler for the controller and kv clerk.
 type ShardCtrler struct {
@@ -44,7 +47,12 @@ func (sck *ShardCtrler) InitController() {
 // pick the key to name the configuration.  The initial configuration
 // lists shardgrp shardcfg.Gid1 for all shards.
 func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
-	// Your code here
+	//OK, ErrVersion, ErrMaybe
+	err := sck.tryPutValueWithRetires(configKey, cfg.String(), 0)
+
+	if err != rpc.OK {
+		panic("InitConfig: put initial config failed")
+	}
 }
 
 // Called by the tester to ask the controller to change the
@@ -53,12 +61,49 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 // controller.
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 	// Your code here.
+	// for the first try let's just put the config
+	// will handle wrong version case later
+	value, version, err := sck.Get(configKey)
+	kvsrv.DPrintf("Query: get value %v version %v err %v", value, version, err)
+	if err != rpc.OK {
+		panic("ChangeConfigTo: get current config failed")
+	}
+
+	var currVersion rpc.Tversion
+	if version == 0 {
+		currVersion = 0
+	} else {
+		currVersion = version
+	}
+	
+	err = sck.tryPutValueWithRetires(configKey, new.String(), currVersion)
+	if err != rpc.OK {
+		panic("ChangeConfigTo: put new config failed")
+	}
 }
 
+func (sck *ShardCtrler) tryPutValueWithRetires(key, value string, version rpc.Tversion) rpc.Err {
+	err := sck.Put(key, value, version)
+	retries := 0
+	for err == rpc.ErrMaybe {
+		err = sck.Put(key, value, version)
+		retries++
+	}
+
+	kvsrv.DPrintf("InitConfig: done trying to put value %v with err %v after %d retries", value, err, retries)
+
+	return err
+}
 
 // Return the current configuration
 func (sck *ShardCtrler) Query() *shardcfg.ShardConfig {
 	// Your code here.
+	value, version, err := sck.Get(configKey)
+	kvsrv.DPrintf("Query: get value %v version %v err %v", value, version, err)
+
+	if err == rpc.OK {
+		return shardcfg.FromString(value)
+	}
+
 	return nil
 }
-
