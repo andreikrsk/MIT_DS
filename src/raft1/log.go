@@ -552,14 +552,13 @@ func (rf *Raft) doCommit() {
 	// Raft never commits log entries from previous terms by counting replicas. Only log entries from the leader’s current
 	// term are committed by counting replicas;
 	// adjCommitIdx := rf.trimmedCommitIndex()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	expectedMatches := (len(rf.peers) / 2) + 1 // number of servers needed for majority
 
 	topMatchIdx := make([]int, 0, len(rf.peers))                // holds all the match indexes, sorted in desc order
 	topMatchIdx = append(topMatchIdx, rf.totalEntreisCount()-1) // leader itself
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	for sid := range rf.peers {
 		if sid == rf.me {

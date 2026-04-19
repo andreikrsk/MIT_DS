@@ -6,6 +6,7 @@ import (
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/shardkv1/shardcfg"
+	"6.5840/shardkv1/shardgrp/shardrpc"
 	tester "6.5840/tester1"
 )
 
@@ -47,6 +48,57 @@ func (ck *Clerk) callPut(s int32, args *rpc.PutArgs, reply *rpc.PutReply) (bool,
 
 	go func() {
 		ok := ck.clnt.Call(ck.servers[s], "KVServer.Put", args, reply)
+		resChan <- ok
+	}()
+
+	select {
+	case ok := <-resChan:
+		return ok, reply.Err
+	case <-deadline:
+		return false, rpc.Err("RPC timeout")
+	}
+}
+
+func (ck *Clerk) callFreezeShard(s int32, args *shardrpc.FreezeShardArgs, reply *shardrpc.FreezeShardReply) (bool, rpc.Err) {
+	deadline := time.After(3 * time.Second)
+	resChan := make(chan bool, 1)
+
+	go func() {
+		ok := ck.clnt.Call(ck.servers[s], "KVServer.FreezeShard", args, reply)
+		resChan <- ok
+	}()
+
+	select {
+	case ok := <-resChan:
+		return ok, reply.Err
+	case <-deadline:
+		return false, rpc.Err("RPC timeout")
+	}
+}
+
+func (ck *Clerk) callInstallShard(s int32, args *shardrpc.InstallShardArgs, reply *shardrpc.InstallShardReply) (bool, rpc.Err) {
+	deadline := time.After(3 * time.Second)
+	resChan := make(chan bool, 1)
+
+	go func() {
+		ok := ck.clnt.Call(ck.servers[s], "KVServer.InstallShard", args, reply)
+		resChan <- ok
+	}()
+
+	select {
+	case ok := <-resChan:
+		return ok, reply.Err
+	case <-deadline:
+		return false, rpc.Err("RPC timeout")
+	}
+}
+
+func (ck *Clerk) callDeleteShard(s int32, args *shardrpc.DeleteShardArgs, reply *shardrpc.DeleteShardReply) (bool, rpc.Err) {
+	deadline := time.After(3 * time.Second)
+	resChan := make(chan bool, 1)
+
+	go func() {
+		ok := ck.clnt.Call(ck.servers[s], "KVServer.DeleteShard", args, reply)
 		resChan <- ok
 	}()
 
@@ -135,16 +187,52 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 }
 
 func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.Err) {
-	// Your code here
-	return nil, ""
+	args := shardrpc.FreezeShardArgs{Shard: s, Num: num}
+	reply := shardrpc.FreezeShardReply{Num: 0, State: nil, Err: rpc.OK}
+
+	rpcCaller := func(s int32) (bool, rpc.Err) {
+		return ck.callFreezeShard(s, &args, &reply)
+	}
+
+	rpcErr := ck.sendReqToMaster(rpcCaller)
+
+	if rpcErr != rpc.OK {
+		return nil, rpcErr
+	}
+
+	return reply.State, reply.Err
 }
 
 func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum) rpc.Err {
-	// Your code here
-	return ""
+	args := shardrpc.InstallShardArgs{Shard: s, State: state, Num: num}
+	reply := shardrpc.InstallShardReply{Err: rpc.OK}
+
+	rpcCaller := func(s int32) (bool, rpc.Err) {
+		return ck.callInstallShard(s, &args, &reply)
+	}
+
+	rpcErr := ck.sendReqToMaster(rpcCaller)
+
+	if rpcErr != rpc.OK {
+		return rpcErr
+	}
+
+	return reply.Err
 }
 
 func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
-	// Your code here
-	return ""
+	args := shardrpc.DeleteShardArgs{Shard: s, Num: num}
+	reply := shardrpc.DeleteShardReply{Err: rpc.OK}
+
+	rpcCaller := func(s int32) (bool, rpc.Err) {
+		return ck.callDeleteShard(s, &args, &reply)
+	}
+
+	rpcErr := ck.sendReqToMaster(rpcCaller)
+
+	if rpcErr != rpc.OK {
+		return rpcErr
+	}
+
+	return reply.Err
 }
