@@ -5,18 +5,18 @@ package shardctrler
 //
 
 import (
-	"fmt"
-
 	kvsrv "6.5840/kvsrv1"
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
 	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp"
+	"6.5840/shardkv1/utils"
 	tester "6.5840/tester1"
 )
 
 const (
-	configKey = "config"
+	initialConfigVersion = 0
+	configKey            = "config"
 )
 
 // ShardCtrler for the controller and kv clerk.
@@ -59,13 +59,9 @@ func (sck *ShardCtrler) InitController() {
 func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 	//OK, ErrVersion, ErrMaybe
 
-	kvsrv.DPrintf("InitConfig: putting initial config %v\n", cfg)
+	utils.DPrintf("[schrdctrler] InitConfig: putting initial config %v\n", cfg.String())
 
-	err := sck.tryPutValueWithRetires(configKey, cfg.String(), 0)
-
-	if err != rpc.OK {
-		panic("InitConfig: put initial config failed")
-	}
+	sck.ChangeConfigTo(cfg)
 }
 
 // Called by the tester to ask the controller to change the
@@ -76,33 +72,84 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 	// Your code here.
 	// for the first try let's just put the config
 	// will handle wrong version case later
-	old := sck.Query()
-
-	transfers := sck.freezeMovingShards(old, new)
-	sck.installShards(new, transfers)
-	sck.deleteShards(old, transfers)
-
-	value, curVersion, err := sck.Get(configKey)
-	kvsrv.DPrintf("Query: get value %v version %v err %v", value, curVersion, err)
-	if err != rpc.OK {
-		panic("ChangeConfigTo: get current config failed")
-	}
-
-	// for now doesnt matter the current config in the kv
-	// just take its version and try to put the new config
-	err = sck.tryPutValueWithRetires(configKey, new.String(), curVersion)
-	for err == rpc.ErrVersion {
-		value, curVersion, err := sck.Get(configKey)
-		kvsrv.DPrintf("Query: get value %v version %v err %v", value, curVersion, err)
-		if err != rpc.OK {
-			panic("ChangeConfigTo: get current config failed")
-		}
-
-		sck.tryPutValueWithRetires(configKey, new.String(), curVersion)
+	err := sck.trySetNewConfig(new)
+	for err != rpc.OK {
+		utils.DPrintf("[schrdctrler] Got error = %v, retrying set new config", err)
+		err = sck.trySetNewConfig(new)
+		// time.Sleep(time.Duration(20) * time.Millisecond)
 	}
 }
 
-func (sck *ShardCtrler) freezeMovingShards(oldConfig, newConfig *shardcfg.ShardConfig) []Transfer {
+func (sck *ShardCtrler) trySetNewConfig(new *shardcfg.ShardConfig) rpc.Err {
+	value, curVersion, err := sck.Get(configKey)
+	utils.DPrintf("[schrdctrler] Query: get value %v version %v err %v", value, curVersion, err)
+
+	switch err {
+	// if old config exists, migrating shards
+	case rpc.OK:
+		// the version of the config can only grow
+		old := shardcfg.FromString(value)
+		// NOT RELEVANT FOR THE 5A
+		// fmt.Printf("Config chahge: old=%d, new=%d\n", old.Num, new.Num)
+		// if old.Num+1 != new.Num {
+		// fmt.Printf("VERSION SKIP: Config chahge: old=%d, new=%d\n", old.Num, new.Num)
+		// }
+		// if old.Num >= new.Num {
+		// return rpc.OK
+		// }
+
+		err = sck.tryMigrateConfigs(old, new)
+		if err != rpc.OK {
+			return err
+		}
+		// if the config is initial one, set the version to defail value
+	case rpc.ErrNoKey:
+		curVersion = initialConfigVersion
+	}
+
+	return sck.tryPutValueWithRetires(configKey, new.String(), curVersion)
+}
+
+func (sck *ShardCtrler) tryMigrateConfigs(old, new *shardcfg.ShardConfig) rpc.Err {
+	transfers := sck.prepareTransfers(old, new)
+
+	// wg := sync.WaitGroup{}
+	// wg.Add(len(transfers))
+	var err rpc.Err
+	for _, transfer := range transfers {
+		// go func() {
+		// defer wg.Done()
+		err = sck.freezeShard(old, new, &transfer)
+		if err != rpc.OK {
+			utils.DPrintf("[schrdctrler] Failed to freeze shards")
+
+			return err
+		}
+
+		err = sck.installShard(new, transfer)
+		if err != rpc.OK {
+			utils.DPrintf("[schrdctrler] Failed to install shards")
+
+			return err
+		}
+
+		err = sck.deleteShards(old, new, transfer)
+		if err != rpc.OK {
+			utils.DPrintf("[schrdctrler] Failed to delete shards")
+
+			return err
+		}
+
+		// return rpc.OK
+		// }()
+	}
+
+	// wg.Wait()
+
+	return rpc.OK
+}
+
+func (sck *ShardCtrler) prepareTransfers(oldConfig, newConfig *shardcfg.ShardConfig) []Transfer {
 	transfers := make([]Transfer, 0)
 
 	for shId, gid := range oldConfig.Shards {
@@ -110,52 +157,58 @@ func (sck *ShardCtrler) freezeMovingShards(oldConfig, newConfig *shardcfg.ShardC
 		if gid != newGid {
 			gid := oldConfig.Shards[shId]
 
-			servers, ok := oldConfig.Groups[gid]
-			if !ok {
-				panic("freezeMovingShards: old config has no group for shard that needs to be frozen, idk how to handle it yet")
-			}
-
-			grpClerk := shardgrp.MakeClerk(sck.clnt, servers)
-			state, err := grpClerk.FreezeShard(shardcfg.Tshid(shId), oldConfig.Num)
-			if err != rpc.OK {
-				panic(fmt.Sprintf("freezeMovingShards: FreezeShard RPC failed for shard %d, gid %d, err %v", shId, gid, err))
-			}
-
-			transfers = append(transfers, Transfer{fromG: gid, toG: newGid, shId: shardcfg.Tshid(shId), state: state})
+			transfers = append(transfers, Transfer{fromG: gid, toG: newGid, shId: shardcfg.Tshid(shId)})
 		}
 	}
 
 	return transfers
 }
 
-func (sck *ShardCtrler) installShards(newConfig *shardcfg.ShardConfig, transfers []Transfer) {
-	for _, transfer := range transfers {
-		serversTo, ok := newConfig.Groups[transfer.toG]
-		if !ok {
-			panic("installShards: new config has no group for shard that needs to be installed, idk how to handle it yet")
-		}
-
-		grpcClerk := shardgrp.MakeClerk(sck.clnt, serversTo)
-		err := grpcClerk.InstallShard(transfer.shId, transfer.state, newConfig.Num)
-		if err != rpc.OK {
-			panic(fmt.Sprintf("installShards: InstallShard RPC failed for shard %d, from gid %d to gid %d, err %v", transfer.shId, transfer.fromG, transfer.toG, err))
-		}
+func (sck *ShardCtrler) freezeShard(oldConfig, newConfig *shardcfg.ShardConfig, transfer *Transfer) rpc.Err {
+	servers, ok := oldConfig.Groups[transfer.fromG]
+	if !ok {
+		panic("freezeMovingShards: old config has no group for shard that needs to be frozen, idk how to handle it yet")
 	}
+
+	grpClerk := shardgrp.MakeClerk(sck.clnt, servers)
+	state, err := grpClerk.FreezeShard(shardcfg.Tshid(transfer.shId), newConfig.Num)
+	if err != rpc.OK {
+		return err
+	}
+
+	transfer.state = state
+
+	return rpc.OK
 }
 
-func (sck *ShardCtrler) deleteShards(oldConfig *shardcfg.ShardConfig, transfers []Transfer) {
-	for _, transfer := range transfers {
-		serversFrom, ok := oldConfig.Groups[transfer.fromG]
-		if !ok {
-			panic("deleteShards: old config has no group for shard that needs to be deleted, idk how to handle it yet")
-		}
-
-		grpcClerk := shardgrp.MakeClerk(sck.clnt, serversFrom)
-		err := grpcClerk.DeleteShard(transfer.shId, oldConfig.Num)
-		if err != rpc.OK {
-			panic(fmt.Sprintf("deleteShards: DeleteShard RPC failed for shard %d, from gid %d to gid %d, err %v", transfer.shId, transfer.fromG, transfer.toG, err))
-		}
+func (sck *ShardCtrler) installShard(newConfig *shardcfg.ShardConfig, transfer Transfer) rpc.Err {
+	serversTo, ok := newConfig.Groups[transfer.toG]
+	if !ok {
+		panic("installShards: new config has no group for shard that needs to be installed, idk how to handle it yet")
 	}
+
+	grpcClerk := shardgrp.MakeClerk(sck.clnt, serversTo)
+	err := grpcClerk.InstallShard(transfer.shId, transfer.state, newConfig.Num)
+	if err != rpc.OK {
+		return err
+	}
+
+	return rpc.OK
+}
+
+func (sck *ShardCtrler) deleteShards(oldConfig, newConfig *shardcfg.ShardConfig, transfer Transfer) rpc.Err {
+	serversFrom, ok := oldConfig.Groups[transfer.fromG]
+	if !ok {
+		panic("deleteShards: old config has no group for shard that needs to be deleted, idk how to handle it yet")
+	}
+
+	grpcClerk := shardgrp.MakeClerk(sck.clnt, serversFrom)
+	err := grpcClerk.DeleteShard(transfer.shId, newConfig.Num)
+	if err != rpc.OK {
+		return err
+	}
+
+	return rpc.OK
 }
 
 func (sck *ShardCtrler) tryPutValueWithRetires(key, value string, version rpc.Tversion) rpc.Err {
@@ -166,7 +219,7 @@ func (sck *ShardCtrler) tryPutValueWithRetires(key, value string, version rpc.Tv
 		retries++
 	}
 
-	kvsrv.DPrintf("InitConfig: done trying to put value %v with err %v after %d retries", value, err, retries)
+	utils.DPrintf("[schrdctrler] tryPutValueWithRetires: done trying to put value %v with err %v after %d retries", value, err, retries)
 
 	return err
 }
@@ -175,7 +228,7 @@ func (sck *ShardCtrler) tryPutValueWithRetires(key, value string, version rpc.Tv
 func (sck *ShardCtrler) Query() *shardcfg.ShardConfig {
 	// Your code here.
 	value, version, err := sck.Get(configKey)
-	kvsrv.DPrintf("Query: get value %v version %v err %v", value, version, err)
+	utils.DPrintf("Query: get value %v version %v err %v", value, version, err)
 
 	if err == rpc.OK {
 		return shardcfg.FromString(value)

@@ -200,6 +200,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	commandIdx, term, isLeader := -1, -1, false
+
+	if rf.killed() {
+		return commandIdx, term, isLeader
+	}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 

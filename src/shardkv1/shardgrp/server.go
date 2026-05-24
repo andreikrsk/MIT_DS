@@ -1,7 +1,10 @@
 package shardgrp
 
+// TestManyConcurrentClerkUnreliable5A
+
 import (
 	"bytes"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -9,9 +12,9 @@ import (
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labgob"
 	"6.5840/labrpc"
-	raft "6.5840/raft1"
 	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp/shardrpc"
+	"6.5840/shardkv1/utils"
 	tester "6.5840/tester1"
 )
 
@@ -60,7 +63,6 @@ type DeleteShardOpResult struct {
 
 func (kv *KVServer) DoOp(req any) any {
 	// Your code here
-
 	switch castedReq := req.(type) {
 	case rpc.GetArgs:
 		return kv.handleGetOp(&castedReq)
@@ -73,144 +75,179 @@ func (kv *KVServer) DoOp(req any) any {
 	case shardrpc.DeleteShardArgs:
 		return kv.handleDeleteShardOp(&castedReq)
 	default:
-		raft.DPrintf("[server=%d] unknown request type: %T", kv.me, castedReq)
+		// unknown type of request, should not happen within the lab
+		panic(fmt.Sprintf("[server=%d] unknown request type: %T", kv.me, castedReq))
 	}
-
-	// unknown type of request, should not happen within the lab
-	return nil
 }
 
 func (kv *KVServer) handleGetOp(args *rpc.GetArgs) GetOpResult {
-	kv.dbLock.RLock()
-	defer kv.dbLock.RUnlock()
+	utils.DPrintf("[server=%d, gid=%d, handleGetOp: shard=%d] key=%v",
+		kv.me, kv.gid, kv.lastSeenConfigNum, args.Key)
 
 	key := args.Key
 	shId := shardcfg.Key2Shard(key)
 
+	utils.DPrintf("[server=%d, gid=%d, handleGetOp: shard=%d] key=%v is on shard=%d",
+		kv.me, kv.gid, kv.lastSeenConfigNum, args.Key, shId)
+
+
 	db, err := kv.getShardDb(shId)
 	if err != rpc.OK {
+		utils.DPrintf("[server=%d, gid=%d, handleGetOp: shard=%d] key=%v is on shard=%d. The group is not the owner of the shard.",
+			kv.me, kv.gid, kv.lastSeenConfigNum, args.Key, shId)
 		return GetOpResult{Err: err}
 	}
 
-	if _, ok := kv.frozenShards[shId]; ok {
-		return GetOpResult{Err: rpc.ErrWrongGroup}
-	}
-
 	if val, ok := db[key]; ok {
+		utils.DPrintf("[server=%d, gid=%d, handleGetOp: shard=%d] key=%v is on shard=%d. Found the key, returning the value. The shard state=%v",
+			kv.me, kv.gid, kv.lastSeenConfigNum, args.Key, shId, db)
 		return GetOpResult{Err: rpc.OK, Value: val.Value, Version: val.Version}
 	} else {
+		utils.DPrintf("[server=%d, gid=%d, handleGetOp: shard=%d] key=%v is on shard=%d. ErrNoKey. The shard state=%v",
+			kv.me, kv.gid, kv.lastSeenConfigNum, args.Key, shId, db)
+
 		return GetOpResult{Err: rpc.ErrNoKey}
 	}
 }
 
 func (kv *KVServer) handlePutOp(args *rpc.PutArgs) PutOpResult {
-	kv.dbLock.Lock()
-	defer kv.dbLock.Unlock()
+	utils.DPrintf("[server=%d, gid=%d, handlePutOp: shard=%d] key=%v, value=%v",
+		kv.me, kv.gid, kv.lastSeenConfigNum, args.Key, args.Value)
 
 	key := args.Key
 	version := args.Version
 	val := args.Value
 	shId := shardcfg.Key2Shard(key)
 
-	db, err := kv.getShardDb(shId)
-	if err != rpc.OK {
-		return PutOpResult{Err: err}
-	}
+	utils.DPrintf("[server=%d, gid=%d, handlePutOp: shard=%d] key=%v, value=%v. Should be placed to the shard=%d",
+		kv.me, kv.gid, kv.lastSeenConfigNum, args.Key, args.Value, shId)
 
 	if _, ok := kv.frozenShards[shId]; ok {
+		utils.DPrintf("[server=%d, gid=%d, handlePutOp: shard=%d] key=%v is on shard=%d. The shard is frozen.",
+			kv.me, kv.gid, kv.lastSeenConfigNum, args.Key, shId)
+
 		return PutOpResult{Err: rpc.ErrWrongGroup}
+	}
+
+	db, err := kv.getShardDb(shId)
+	if err != rpc.OK {
+		utils.DPrintf("[server=%d, gid=%d, handlePutOp: shard=%d] key=%v is on shard=%d. The group is not the owner of the shard.",
+			kv.me, kv.gid, kv.lastSeenConfigNum, args.Key, shId)
+
+		return PutOpResult{Err: err}
 	}
 
 	dbVal, ok := db[key]
 
-	if !ok || version == dbVal.Version {
-		db[key] = DbValue{Value: val, Version: version + 1}
-		return PutOpResult{Err: rpc.OK}
+	// 1 true true -> (in db, and the version == db.version) -> update the value
+	// 2 true false ->(in db, and the version != db.version) -> ErrVersion
+
+	// 3 false true -> (not in the db, and the version == 0) -> update the value, it is not in the db
+	// 4 false false -> (not in the db, and the version != 0) -> update the value, it is not in the db
+
+	if ok {
+		if version == dbVal.Version { // 1
+			db[key] = DbValue{Value: val, Version: version + 1}
+			utils.DPrintf("[server=%d, gid=%d, handlePutOp: shard=%d] key=%v is on shard=%d. Stored the key. The shard state=%v",
+				kv.me, kv.gid, kv.lastSeenConfigNum, args.Key, shId, db)
+			return PutOpResult{Err: rpc.OK}
+		} else { // 2
+			return PutOpResult{Err: rpc.ErrVersion}
+		}
 	} else {
-		return PutOpResult{Err: rpc.ErrVersion}
+		if version == 0 { // 3
+			db[key] = DbValue{Value: val, Version: version + 1}
+			utils.DPrintf("[server=%d, gid=%d, handlePutOp: shard=%d] key=%v is on shard=%d. Stored the key. The shard state=%v",
+				kv.me, kv.gid, kv.lastSeenConfigNum, args.Key, shId, db)
+			return PutOpResult{Err: rpc.OK}
+		} else { // 4
+			return PutOpResult{Err: rpc.ErrNoKey}
+		}
 	}
 }
 
 func (kv *KVServer) handleFreezeShardOp(args *shardrpc.FreezeShardArgs) FreezeShardOpResult {
-	kv.dbLock.RLock()
-	defer kv.dbLock.RUnlock()
+	utils.DPrintf("[server=%d, gid=%d, handleFreezeShardOp: shard=%d, num=%d, lastSeenConfigNum=%d]",
+		kv.me, kv.gid, args.Shard, args.Num, kv.lastSeenConfigNum)
 
-	raft.DPrintf("handleFreezeShardOp: shard=%d, num=%d, lastSeenConfigNum=%d", args.Shard, args.Num, kv.lastSeenConfigNum)
-
+	// the operation is idempotent. can be called > 1 times for the same Num
 	if args.Num < kv.lastSeenConfigNum[args.Shard] {
-		panic("Received FreezeShard request with old config num, idk how to handle it yet")
+		return FreezeShardOpResult{Err: rpc.OK}
 	}
+	kv.lastSeenConfigNum[args.Shard] = args.Num
 
+	// if no db, probably no op, just continue
 	db, err := kv.getShardDb(args.Shard)
 	if err != rpc.OK {
-		return FreezeShardOpResult{Err: err}
+		utils.DPrintf("[server=%d, gid=%d, handleFreezeShardOp: shard=%d, num=%d, lastSeenConfigNum=%d] failed with err %v",
+			kv.me, kv.gid, args.Shard, args.Num, kv.lastSeenConfigNum, err)
 	}
-
-	// probably no op
-	// _, ok := kv.frozenShards[args.Shard]
-	// if ok {
-	// panic("Received FreezeShard request for a shard that is already frozen, idk how to handle it yet")
-	// }
 
 	kv.frozenShards[args.Shard] = struct{}{}
 
-	kv.lastSeenConfigNum[args.Shard] = args.Num
+	utils.DPrintf("[server=%d, gid=%d, handleFreezeShardOp: shard=%d, num=%d, lastSeenConfigNum=%d]. Returning state %v",
+		kv.me, kv.gid, args.Shard, args.Num, kv.lastSeenConfigNum, db)
+
 	return FreezeShardOpResult{
-		State: kv.encodeData(db),
+		State: kv.encodeData(kv.makeShardDbCopy(args.Shard)),
 		Num:   args.Num,
 		Err:   rpc.OK,
 	}
 }
 
 func (kv *KVServer) handleInstallShardOp(args *shardrpc.InstallShardArgs) InstallShardOpResult {
-	kv.dbLock.RLock()
-	defer kv.dbLock.RUnlock()
+	db := make(map[string]DbValue, 0)
 
-	raft.DPrintf("handleInstallShardOp: shard=%d, num=%d, lastSeenConfigNum=%d", args.Shard, args.Num, kv.lastSeenConfigNum)
+	// deserialize outside of the lock
+	if len(args.State) > 0 {
+		r := bytes.NewBuffer(args.State)
+		d := labgob.NewDecoder(r)
 
-	if args.Num < kv.lastSeenConfigNum[args.Shard] {
-		panic("Received FreezeShard request with old config num, idk how to handle it yet")
+		if err := d.Decode(&db); err != nil {
+			panic(fmt.Sprintf("Error reading persistent state, args = %v, err = %v", args, err.Error()))
+		}
 	}
 
-	_, err := kv.getShardDb(args.Shard)
-	if err == rpc.OK {
-		panic("Recieved InstallShard request for a shard that already exists in the db, idk how to handle it yet")
+	utils.DPrintf("[server=%d, gid=%d, handleInstallShardOp: shard=%d, num=%d, lastSeenConfigNum=%d] starting. Recieved state = %v",
+		kv.me, kv.gid, args.Shard, args.Num, kv.lastSeenConfigNum, db)
+
+	// verify leniariz for the shard. if outdated -> OK
+	// it should be impossible to install a shard for the Num twice
+	if args.Num <= kv.lastSeenConfigNum[args.Shard] {
+		// panic("Received FreezeShard request with old config num, idk how to handle it yet")
+		utils.DPrintf("[server=%d, gid=%d, handleInstallShardOp: shard=%d, num=%d, lastSeenConfigNum=%d] returning no op",
+			kv.me, kv.gid, args.Shard, args.Num, kv.lastSeenConfigNum)
+		return InstallShardOpResult{Err: rpc.OK}
 	}
-
-	r := bytes.NewBuffer(args.State)
-	d := labgob.NewDecoder(r)
-
-	var db map[string]DbValue
-
-	if d.Decode(&db) != nil {
-		panic("Error reading persistent state")
-	} else {
-		kv.db[args.Shard] = db
-	}
-
 	kv.lastSeenConfigNum[args.Shard] = args.Num
+
+	kv.db[args.Shard] = db
+
+	// unfroze if some stale operation have not complete the process and the shard is frozen
+	delete(kv.frozenShards, args.Shard)
+
+	utils.DPrintf("[server=%d, gid=%d, handleInstallShardOp: shard=%d, num=%d, lastSeenConfigNum=%d] returning",
+		kv.me, kv.gid, args.Shard, args.Num, kv.lastSeenConfigNum)
+
 	return InstallShardOpResult{Err: rpc.OK}
 }
 
 func (kv *KVServer) handleDeleteShardOp(args *shardrpc.DeleteShardArgs) DeleteShardOpResult {
-	kv.dbLock.RLock()
-	defer kv.dbLock.RUnlock()
+	utils.DPrintf("[server=%d, gid=%d, handleDeleteShardOp: shard=%d, num=%d, lastSeenConfigNum=%d]",
+		kv.me, kv.gid, args.Shard, args.Num, kv.lastSeenConfigNum)
 
-	raft.DPrintf("handleDeleteShardOp: shard=%d, num=%d, lastSeenConfigNum=%d", args.Shard, args.Num, kv.lastSeenConfigNum)
-
+	// verify leniariz for the shard. if outdated -> OK
+	// as first interaction for the Num should be the Freeze operation, we should allow to call the Delete with the same Num
+	// the Install operation makes sure in case of retries the deleted shard will not be installed again
 	if args.Num < kv.lastSeenConfigNum[args.Shard] {
-		panic("Received DeleteShard request with old config num, idk how to handle it yet")
+		// panic("Received DeleteShard request with old config num, idk how to handle it yet")
+		return DeleteShardOpResult{
+			Err: rpc.OK,
+		}
 	}
 
-	_, err := kv.getShardDb(args.Shard)
-	if err != rpc.OK {
-		return DeleteShardOpResult{Err: err}
-	}
-
-	_, ok := kv.frozenShards[args.Shard]
-	if !ok {
-		panic("Received DeleteShard request for a shard that is not frozen, idk how to handle it yet")
-	}
+	// update version
+	kv.lastSeenConfigNum[args.Shard] = args.Num
 
 	delete(kv.db, args.Shard)
 	delete(kv.frozenShards, args.Shard)
@@ -232,9 +269,6 @@ func (kv *KVServer) getShardDb(shId shardcfg.Tshid) (map[string]DbValue, rpc.Err
 
 func (kv *KVServer) Snapshot() []byte {
 	// Your code here
-	kv.dbLock.RLock()
-	defer kv.dbLock.RUnlock()
-
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
@@ -254,9 +288,6 @@ func (kv *KVServer) encodeData(data any) []byte {
 
 func (kv *KVServer) Restore(data []byte) {
 	// Your code here
-	kv.dbLock.Lock()
-	defer kv.dbLock.Unlock()
-
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
@@ -270,6 +301,16 @@ func (kv *KVServer) Restore(data []byte) {
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
+	utils.DPrintf("[server=%d, gid=%d, server=%d] Called Get with args = [%v]",
+		kv.me, kv.gid, kv.me, args)
+
+	if kv.killed() {
+		utils.DPrintf("[server=%d, gid=%d, server=%d] Returning from Get as the KVServer is killed",
+			kv.me, kv.gid, kv.me)
+		reply.Err = rpc.ErrWrongGroup
+		return
+	}
+
 	// Your code here
 	err, res := kv.rsm.Submit(*args)
 	// Your code here. Use kv.rsm.Submit() to submit args
@@ -291,6 +332,16 @@ func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 }
 
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
+	utils.DPrintf("[server=%d, gid=%d, server=%d] Called Put with args = [%v]",
+		kv.me, kv.gid, kv.me, args)
+
+	if kv.killed() {
+		utils.DPrintf("[server=%d, gid=%d, server=%d] Returning from Put as the KVServer is killed",
+			kv.me, kv.gid, kv.me)
+		reply.Err = rpc.ErrWrongGroup
+		return
+	}
+
 	// Your code here
 	err, res := kv.rsm.Submit(*args)
 	// Your code here. Use kv.rsm.Submit() to submit args
@@ -307,6 +358,16 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 // Freeze the specified shard (i.e., reject future Get/Puts for this
 // shard) and return the key/values stored in that shard.
 func (kv *KVServer) FreezeShard(args *shardrpc.FreezeShardArgs, reply *shardrpc.FreezeShardReply) {
+	utils.DPrintf("[server=%d, gid=%d, server=%d] Calling the FreezeShard in the server with [%v]",
+		kv.me, kv.gid, kv.me, args)
+
+	if kv.killed() {
+		utils.DPrintf("[server=%d, gid=%d, server=%d] Returning from FreezeShard as the KVServer is killed",
+			kv.me, kv.gid, kv.me)
+		reply.Err = rpc.ErrWrongGroup
+		return
+	}
+
 	// Your code here
 	err, res := kv.rsm.Submit(*args)
 
@@ -323,6 +384,13 @@ func (kv *KVServer) FreezeShard(args *shardrpc.FreezeShardArgs, reply *shardrpc.
 
 // Install the supplied state for the specified shard.
 func (kv *KVServer) InstallShard(args *shardrpc.InstallShardArgs, reply *shardrpc.InstallShardReply) {
+	if kv.killed() {
+		utils.DPrintf("[server=%d, gid=%d, server=%d] Returning from InstallShard as the KVServer is killed",
+			kv.me, kv.gid, kv.me)
+		reply.Err = rpc.ErrWrongGroup
+		return
+	}
+
 	// Your code here
 	err, res := kv.rsm.Submit(*args)
 
@@ -338,6 +406,13 @@ func (kv *KVServer) InstallShard(args *shardrpc.InstallShardArgs, reply *shardrp
 // Delete the specified shard.
 func (kv *KVServer) DeleteShard(args *shardrpc.DeleteShardArgs, reply *shardrpc.DeleteShardReply) {
 	// Your code here
+	if kv.killed() {
+		utils.DPrintf("[server=%d, gid=%d, server=%d] Returning from DeleteShard as the KVServer is killed",
+			kv.me, kv.gid, kv.me)
+		reply.Err = rpc.ErrWrongGroup
+		return
+	}
+
 	err, res := kv.rsm.Submit(*args)
 
 	if err == rpc.OK {
@@ -350,9 +425,6 @@ func (kv *KVServer) DeleteShard(args *shardrpc.DeleteShardArgs, reply *shardrpc.
 }
 
 func (kv *KVServer) makeShardDbCopy(shId shardcfg.Tshid) map[string]DbValue {
-	kv.dbLock.RLock()
-	defer kv.dbLock.RUnlock()
-
 	dbCopy := make(map[string]DbValue)
 
 	for k, v := range kv.db[shId] {
@@ -373,6 +445,7 @@ func (kv *KVServer) makeShardDbCopy(shId shardcfg.Tshid) map[string]DbValue {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	// Your code here, if desired.
+	utils.DPrintf("[gid=%d, server=%d] Called killed within the KVServer", kv.gid, kv.me)
 }
 
 func (kv *KVServer) killed() bool {
@@ -407,7 +480,7 @@ func StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, p
 		// initialize the first group with all shards assigned to it
 		for shId := 0; shId < shardcfg.NShards; shId++ {
 			kv.db[shardcfg.Tshid(shId)] = make(map[string]DbValue)
-			kv.lastSeenConfigNum[shardcfg.Tshid(shId)] = shardcfg.NumFirst
+			kv.lastSeenConfigNum[shardcfg.Tshid(shId)] = 0
 		}
 	}
 

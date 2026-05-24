@@ -7,7 +7,18 @@ import (
 	"6.5840/kvsrv1/rpc"
 	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp/shardrpc"
+	"6.5840/shardkv1/utils"
 	tester "6.5840/tester1"
+)
+
+type NetworkReply int
+
+const (
+	rpcTimeout = 3
+
+	TIMEOUT NetworkReply = iota
+	DISCONNECT
+	OK
 )
 
 type Clerk struct {
@@ -25,9 +36,11 @@ func MakeClerk(clnt *tester.Clnt, servers []string) *Clerk {
 	return ck
 }
 
-func (ck *Clerk) callGet(s int32, args *rpc.GetArgs, reply *rpc.GetReply) (bool, rpc.Err) {
-	deadline := time.After(3 * time.Second)
+func (ck *Clerk) callGet(s int32, args *rpc.GetArgs, reply *rpc.GetReply) (NetworkReply, rpc.Err) {
+	deadline := time.After(rpcTimeout * time.Second)
 	resChan := make(chan bool, 1)
+
+	utils.DPrintf("[shardgrp/clerk] Calling callGet for %v", args)
 
 	go func() {
 		ok := ck.clnt.Call(ck.servers[s], "KVServer.Get", args, reply)
@@ -36,15 +49,20 @@ func (ck *Clerk) callGet(s int32, args *rpc.GetArgs, reply *rpc.GetReply) (bool,
 
 	select {
 	case ok := <-resChan:
-		return ok, reply.Err
+		if ok {
+			return OK, reply.Err
+		}
+		return DISCONNECT, reply.Err
 	case <-deadline:
-		return false, rpc.Err("RPC timeout")
+		return TIMEOUT, rpc.OK
 	}
 }
 
-func (ck *Clerk) callPut(s int32, args *rpc.PutArgs, reply *rpc.PutReply) (bool, rpc.Err) {
-	deadline := time.After(3 * time.Second)
+func (ck *Clerk) callPut(s int32, args *rpc.PutArgs, reply *rpc.PutReply) (NetworkReply, rpc.Err) {
+	deadline := time.After(rpcTimeout * time.Second)
 	resChan := make(chan bool, 1)
+
+	utils.DPrintf("[shardgrp/clerk] Calling callPut for %v", args)
 
 	go func() {
 		ok := ck.clnt.Call(ck.servers[s], "KVServer.Put", args, reply)
@@ -53,15 +71,20 @@ func (ck *Clerk) callPut(s int32, args *rpc.PutArgs, reply *rpc.PutReply) (bool,
 
 	select {
 	case ok := <-resChan:
-		return ok, reply.Err
+		if ok {
+			return OK, reply.Err
+		}
+		return DISCONNECT, reply.Err
 	case <-deadline:
-		return false, rpc.Err("RPC timeout")
+		return TIMEOUT, rpc.OK
 	}
 }
 
-func (ck *Clerk) callFreezeShard(s int32, args *shardrpc.FreezeShardArgs, reply *shardrpc.FreezeShardReply) (bool, rpc.Err) {
-	deadline := time.After(3 * time.Second)
+func (ck *Clerk) callFreezeShard(s int32, args *shardrpc.FreezeShardArgs, reply *shardrpc.FreezeShardReply) (NetworkReply, rpc.Err) {
+	deadline := time.After(rpcTimeout * time.Second)
 	resChan := make(chan bool, 1)
+
+	// utils.DPrintf("Calling callFreezeShard for %v", args)
 
 	go func() {
 		ok := ck.clnt.Call(ck.servers[s], "KVServer.FreezeShard", args, reply)
@@ -70,15 +93,20 @@ func (ck *Clerk) callFreezeShard(s int32, args *shardrpc.FreezeShardArgs, reply 
 
 	select {
 	case ok := <-resChan:
-		return ok, reply.Err
+		if ok {
+			return OK, reply.Err
+		}
+		return DISCONNECT, reply.Err
 	case <-deadline:
-		return false, rpc.Err("RPC timeout")
+		return TIMEOUT, rpc.OK
 	}
 }
 
-func (ck *Clerk) callInstallShard(s int32, args *shardrpc.InstallShardArgs, reply *shardrpc.InstallShardReply) (bool, rpc.Err) {
-	deadline := time.After(3 * time.Second)
+func (ck *Clerk) callInstallShard(s int32, args *shardrpc.InstallShardArgs, reply *shardrpc.InstallShardReply) (NetworkReply, rpc.Err) {
+	deadline := time.After(rpcTimeout * time.Second)
 	resChan := make(chan bool, 1)
+
+	utils.DPrintf("[shardgrp/clerk] Calling callInstallShard for shardId=%d, num=%d", args.Shard, args.Num)
 
 	go func() {
 		ok := ck.clnt.Call(ck.servers[s], "KVServer.InstallShard", args, reply)
@@ -87,15 +115,20 @@ func (ck *Clerk) callInstallShard(s int32, args *shardrpc.InstallShardArgs, repl
 
 	select {
 	case ok := <-resChan:
-		return ok, reply.Err
+		if ok {
+			return OK, reply.Err
+		}
+		return DISCONNECT, reply.Err
 	case <-deadline:
-		return false, rpc.Err("RPC timeout")
+		return TIMEOUT, rpc.OK
 	}
 }
 
-func (ck *Clerk) callDeleteShard(s int32, args *shardrpc.DeleteShardArgs, reply *shardrpc.DeleteShardReply) (bool, rpc.Err) {
-	deadline := time.After(3 * time.Second)
+func (ck *Clerk) callDeleteShard(s int32, args *shardrpc.DeleteShardArgs, reply *shardrpc.DeleteShardReply) (NetworkReply, rpc.Err) {
+	deadline := time.After(rpcTimeout * time.Second)
 	resChan := make(chan bool, 1)
+
+	utils.DPrintf("[shardgrp/clerk] Calling callDeleteShard for shardId=%d, num=%d", args.Shard, args.Num)
 
 	go func() {
 		ok := ck.clnt.Call(ck.servers[s], "KVServer.DeleteShard", args, reply)
@@ -104,27 +137,34 @@ func (ck *Clerk) callDeleteShard(s int32, args *shardrpc.DeleteShardArgs, reply 
 
 	select {
 	case ok := <-resChan:
-		return ok, reply.Err
+		if ok {
+			return OK, reply.Err
+		}
+		return DISCONNECT, reply.Err
 	case <-deadline:
-		return false, rpc.Err("RPC timeout")
+		return TIMEOUT, rpc.OK
 	}
 }
 
 // retry logic
-func (ck *Clerk) sendReqToMaster(rpcCaller func(s int32) (bool, rpc.Err)) rpc.Err {
+func (ck *Clerk) sendReqToMaster(rpcCaller func(s int32) (NetworkReply, rpc.Err)) rpc.Err {
 	currentLeader := ck.leader.Load()
-	ok, rpcErr := rpcCaller(currentLeader)
+	ntReply, rpcErr := rpcCaller(currentLeader)
+	utils.DPrintf("[shardgrp/clerk] sendReqToMaster response: ntReply=%v, rpcErr=%v", ntReply, rpcErr)
+	hadLostCalls := ntReply == TIMEOUT || ntReply == DISCONNECT
+	// partition := ntReply == DISCONNECT
+	// if partition {
+	// fmt.Println("Partitioned")
+	// }
 
-	hadLostCalls := !ok
-
-	if !ok || rpcErr == rpc.ErrWrongLeader {
+	if hadLostCalls || rpcErr == rpc.ErrWrongLeader {
 		for {
+			partitions := 0
 			for idx := range ck.servers {
-				ok, rpcErr := rpcCaller(int32(idx))
+				ntReply, rpcErr := rpcCaller(int32(idx))
+				utils.DPrintf("[shardgrp/clerk] sendReqToMaster response: ntReply=%v, rpcErr=%v", ntReply, rpcErr)
 
-				if !ok {
-					hadLostCalls = true
-				} else {
+				if ntReply == OK {
 					switch rpcErr {
 					case rpc.OK:
 						ck.leader.CompareAndSwap(currentLeader, int32(idx))
@@ -139,11 +179,26 @@ func (ck *Clerk) sendReqToMaster(rpcCaller func(s int32) (bool, rpc.Err)) rpc.Er
 					case rpc.ErrWrongLeader:
 						// try the next server
 						continue
+					case rpc.ErrWrongGroup:
+						if hadLostCalls {
+							return rpc.ErrMaybe
+						}
+						return rpc.ErrWrongGroup
 					default:
 						// some other error, return it
 						return rpcErr
 					}
+				} else if ntReply == TIMEOUT {
+					utils.DPrintf("[shardgrp/clerk] Timeout to server = %v", ck.servers[idx])
+					hadLostCalls = true
+				} else {
+					partitions++
+					hadLostCalls = true
 				}
+			}
+			if partitions == len(ck.servers) {
+				utils.DPrintf("[shardgrp/clerk] All servers are partitioned, retrying")
+				return rpc.ErrMaybe
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
@@ -154,9 +209,9 @@ func (ck *Clerk) sendReqToMaster(rpcCaller func(s int32) (bool, rpc.Err)) rpc.Er
 
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	args := rpc.GetArgs{Key: key}
-	reply := rpc.GetReply{Value: "", Version: 0, Err: rpc.ErrNoKey}
+	reply := rpc.GetReply{Value: "", Version: 0, Err: rpc.OK}
 
-	rpcCaller := func(s int32) (bool, rpc.Err) {
+	rpcCaller := func(s int32) (NetworkReply, rpc.Err) {
 		return ck.callGet(s, &args, &reply)
 	}
 
@@ -173,11 +228,15 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	args := rpc.PutArgs{Key: key, Value: value, Version: version}
 	reply := rpc.PutReply{Err: rpc.OK}
 
-	rpcCaller := func(s int32) (bool, rpc.Err) {
+	utils.DPrintf("[shardgrp/clerk] Put: key=%s, value=%s, version=%d", key, value, version)
+
+	rpcCaller := func(s int32) (NetworkReply, rpc.Err) {
 		return ck.callPut(s, &args, &reply)
 	}
 
 	rpcErr := ck.sendReqToMaster(rpcCaller)
+
+	utils.DPrintf("[shardgrp/clerk] Put: done calling callPut with rpcErr=%v and reply.Err=%v", rpcErr, reply.Err)
 
 	if rpcErr != rpc.OK {
 		return rpcErr
@@ -190,7 +249,7 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.E
 	args := shardrpc.FreezeShardArgs{Shard: s, Num: num}
 	reply := shardrpc.FreezeShardReply{Num: 0, State: nil, Err: rpc.OK}
 
-	rpcCaller := func(s int32) (bool, rpc.Err) {
+	rpcCaller := func(s int32) (NetworkReply, rpc.Err) {
 		return ck.callFreezeShard(s, &args, &reply)
 	}
 
@@ -207,7 +266,7 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 	args := shardrpc.InstallShardArgs{Shard: s, State: state, Num: num}
 	reply := shardrpc.InstallShardReply{Err: rpc.OK}
 
-	rpcCaller := func(s int32) (bool, rpc.Err) {
+	rpcCaller := func(s int32) (NetworkReply, rpc.Err) {
 		return ck.callInstallShard(s, &args, &reply)
 	}
 
@@ -224,7 +283,7 @@ func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 	args := shardrpc.DeleteShardArgs{Shard: s, Num: num}
 	reply := shardrpc.DeleteShardReply{Err: rpc.OK}
 
-	rpcCaller := func(s int32) (bool, rpc.Err) {
+	rpcCaller := func(s int32) (NetworkReply, rpc.Err) {
 		return ck.callDeleteShard(s, &args, &reply)
 	}
 
