@@ -151,11 +151,7 @@ func (ck *Clerk) sendReqToMaster(rpcCaller func(s int32) (NetworkReply, rpc.Err)
 	currentLeader := ck.leader.Load()
 	ntReply, rpcErr := rpcCaller(currentLeader)
 	utils.DPrintf("[shardgrp/clerk] sendReqToMaster response: ntReply=%v, rpcErr=%v", ntReply, rpcErr)
-	hadLostCalls := ntReply == TIMEOUT || ntReply == DISCONNECT
-	// partition := ntReply == DISCONNECT
-	// if partition {
-	// fmt.Println("Partitioned")
-	// }
+	hadLostCalls := ntReply != OK
 
 	if hadLostCalls || rpcErr == rpc.ErrWrongLeader {
 		for {
@@ -164,38 +160,23 @@ func (ck *Clerk) sendReqToMaster(rpcCaller func(s int32) (NetworkReply, rpc.Err)
 				ntReply, rpcErr := rpcCaller(int32(idx))
 				utils.DPrintf("[shardgrp/clerk] sendReqToMaster response: ntReply=%v, rpcErr=%v", ntReply, rpcErr)
 
-				if ntReply == OK {
-					switch rpcErr {
-					case rpc.OK:
-						ck.leader.CompareAndSwap(currentLeader, int32(idx))
-						return rpc.OK
-					case rpc.ErrVersion:
-						// the first call failed, we don't know if the Put was performed or not, return ErrMaybe
-						ck.leader.CompareAndSwap(currentLeader, int32(idx))
-						if hadLostCalls {
-							return rpc.ErrMaybe
-						}
-						return rpc.ErrVersion
-					case rpc.ErrWrongLeader:
-						// try the next server
-						continue
-					case rpc.ErrWrongGroup:
-						if hadLostCalls {
-							return rpc.ErrMaybe
-						}
-						return rpc.ErrWrongGroup
-					default:
-						// some other error, return it
-						return rpcErr
+				switch ntReply {
+				case OK:
+					err := ck.inferRPCCodeOnNetworkOK(currentLeader, int32(idx), hadLostCalls, rpcErr)
+					if err != nil {
+						return *err
 					}
-				} else if ntReply == TIMEOUT {
+				case TIMEOUT:
 					utils.DPrintf("[shardgrp/clerk] Timeout to server = %v", ck.servers[idx])
 					hadLostCalls = true
-				} else {
+				case DISCONNECT:
 					partitions++
 					hadLostCalls = true
+				default:
+					panic("Unknown NetworkReply")
 				}
 			}
+			
 			if partitions == len(ck.servers) {
 				utils.DPrintf("[shardgrp/clerk] All servers are partitioned, retrying")
 				return rpc.ErrMaybe
@@ -205,6 +186,36 @@ func (ck *Clerk) sendReqToMaster(rpcCaller func(s int32) (NetworkReply, rpc.Err)
 	}
 
 	return rpcErr
+}
+
+func (ck *Clerk) inferRPCCodeOnNetworkOK(currentLeader, newLeader int32, hadLostCalls bool, rpcErr rpc.Err) *rpc.Err {
+	var rpcErrToReturn rpc.Err
+
+	switch rpcErr {
+	case rpc.OK:
+		ck.leader.CompareAndSwap(currentLeader, newLeader)
+		rpcErrToReturn = rpc.OK
+	case rpc.ErrVersion:
+		// the first call failed, we don't know if the Put was performed or not, return ErrMaybe
+		ck.leader.CompareAndSwap(currentLeader, newLeader)
+		if hadLostCalls {
+			rpcErrToReturn = rpc.ErrMaybe
+		}
+		rpcErrToReturn = rpc.ErrVersion
+	case rpc.ErrWrongLeader:
+		// try the next server
+		// has to return nil and continue looking for the leader
+	case rpc.ErrWrongGroup:
+		if hadLostCalls {
+			rpcErrToReturn = rpc.ErrMaybe
+		}
+		rpcErrToReturn = rpc.ErrWrongGroup
+	default:
+		// some other error, return it
+		rpcErrToReturn = rpcErr
+	}
+
+	return &rpcErrToReturn
 }
 
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
