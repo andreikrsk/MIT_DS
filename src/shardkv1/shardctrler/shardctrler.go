@@ -37,11 +37,6 @@ type Transfer struct {
 	state []byte
 }
 
-type KVConfig struct {
-	version rpc.Tversion
-	config  *shardcfg.ShardConfig
-}
-
 // Make a ShardCltler, which stores its state in a kvsrv.
 func MakeShardCtrler(clnt *tester.Clnt) *ShardCtrler {
 	sck := &ShardCtrler{clnt: clnt}
@@ -226,6 +221,7 @@ func (sck *ShardCtrler) setCofnigValueByKey(key string, config *shardcfg.ShardCo
 
 	return err
 }
+
 func (sck *ShardCtrler) transferShards(old, new *shardcfg.ShardConfig) rpc.Err {
 	err := sck.tryTransferShards(old, new)
 	if err == rpc.OK {
