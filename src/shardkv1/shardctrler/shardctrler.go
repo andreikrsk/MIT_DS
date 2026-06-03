@@ -5,6 +5,11 @@ package shardctrler
 //
 
 import (
+	"fmt"
+	"math"
+	"sync/atomic"
+	"time"
+
 	kvsrv "6.5840/kvsrv1"
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
@@ -12,12 +17,12 @@ import (
 	"6.5840/shardkv1/shardgrp"
 	"6.5840/shardkv1/utils"
 	tester "6.5840/tester1"
+	"github.com/google/uuid"
 )
 
 const (
-	INITIAL_CONFIG_VERSION = 0
-	CONFIG_KEY             = "config"
-	NEXT_CONFIG_KEY        = "nextConfig"
+	CONFIG_KEY      = "config"
+	NEXT_CONFIG_KEY = "nextConfig"
 )
 
 // ShardCtrler for the controller and kv clerk.
@@ -28,6 +33,8 @@ type ShardCtrler struct {
 	killed int32 // set by Kill()
 
 	// Your data here.
+	lastConfig atomic.Pointer[shardcfg.ShardConfig]
+	me         uuid.UUID
 }
 
 type Transfer struct {
@@ -42,6 +49,11 @@ func MakeShardCtrler(clnt *tester.Clnt) *ShardCtrler {
 	sck := &ShardCtrler{clnt: clnt}
 	srv := tester.ServerName(tester.GRP0, 0)
 	sck.IKVClerk = kvsrv.MakeClerk(clnt, srv)
+	sck.lastConfig = atomic.Pointer[shardcfg.ShardConfig]{}
+	sck.lastConfig.Store(shardcfg.MakeShardConfig())
+	sck.me = uuid.New()
+	utils.DPrintf("[%s] Updated last config in memory to %v", sck.me, sck.lastConfig.Load())
+
 	// Your code here.
 	return sck
 }
@@ -59,6 +71,11 @@ func (sck *ShardCtrler) InitController() {
 	if curErr == rpc.ErrNoKey && curErr == nextErr {
 		utils.DPrintf("[schrdctrler] InitController: both current and next config not found, starting with empty state")
 		return
+	}
+
+	if curErr == rpc.OK {
+		sck.lastConfig.Store(shardcfg.FromString(value))
+		utils.DPrintf("[%s] Updated last config in memory to %v", sck.me, sck.lastConfig.Load())
 	}
 
 	if curVersion == nextVersion {
@@ -82,7 +99,12 @@ func (sck *ShardCtrler) InitController() {
 func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 	//OK, ErrVersion, ErrMaybe
 
-	utils.DPrintf("[schrdctrler] InitConfig: putting initial config %v\n", cfg.String())
+	utils.DPrintf("[schrdctrler][%s] InitConfig: putting initial config %v\n", sck.me, cfg.String())
+
+	sck.lastConfig.Store(cfg)
+	utils.DPrintf("[%s] Updated last config in memory to %v", sck.me, sck.lastConfig.Load())
+
+	// panic("InitConfig: not implemented yet") // You can delete this line.
 
 	sck.ChangeConfigTo(cfg)
 }
@@ -101,23 +123,35 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 		utils.DPrintf("[schrdctrler] Query[next]: get value %v version %v err %v", nextValue, nextVersion, nextErr)
 
 		if curErr == rpc.ErrNoKey && curErr == nextErr {
-			utils.DPrintf("[schrdctrler] InitController: both current and next config not found, starting with empty state")
+			utils.DPrintf("[schrdctrler] ChangeConfigTo: both current and next config not found, starting with empty state")
 
 			err := sck.handleBothEmptyConfig(new)
 			if err != rpc.OK {
-				utils.DPrintf("[schrdctrler] InitController: failed to handle both empty config, err = %v, retrying", err)
+				utils.DPrintf("[schrdctrler] ChangeConfigTo: failed to handle both empty config, err = %v, retrying", err)
 				continue
 			}
 
 			return
 		}
 
-		if curErr == rpc.ErrNoKey && nextErr == rpc.OK {
-			utils.DPrintf("[schrdctrler] InitController: no current config found, but next config found, setting current config to next config value")
+		// the next version should be non-decreasing
+		if nextErr == rpc.OK && (rpc.Tversion)(new.Num) < nextVersion {
+			utils.DPrintf("[schrdctrler] ChangeConfigTo: next config version %v is greater than new config version %v, returning", nextVersion, new.Num)
 
-			err := sck.handleNoCurrentNextExists(new)
+			return
+		}
+
+		if curErr == rpc.ErrNoKey && nextErr == rpc.OK {
+			utils.DPrintf("[schrdctrler]ChangeConfigTo: no current config found, but next config found, setting current config to next config value")
+
+			if (rpc.Tversion)(new.Num) > nextVersion {
+				utils.DPrintf("[sahrdctrler] ChangeConfigTo: next config version %v equals new config version %v, but the old controller is still in progress. Need to retry", nextVersion, new.Num)
+				continue
+			}
+
+			err := sck.handleNoCurrentNextExists(shardcfg.FromString(nextValue))
 			if err != rpc.OK {
-				utils.DPrintf("[schrdctrler] InitController: failed to handle no current config but next config exists, err = %v, retrying", err)
+				utils.DPrintf("[schrdctrler] ChangeConfigTo: failed to handle no current config but next config exists, err = %v, retrying", err)
 				continue
 			}
 
@@ -125,84 +159,111 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 		}
 
 		if curVersion == nextVersion {
-			utils.DPrintf("[schrdctrler] InitController: cur version %v equals next version %v. The last operation was successful.", curVersion, nextVersion)
-			err := sck.handleSameVersions(shardcfg.FromString(value), new, curVersion, nextVersion)
+			utils.DPrintf("[schrdctrler] ChangeConfigTo: cur version %v equals next version %v. The last operation was successful.", curVersion, nextVersion)
+
+			if (rpc.Tversion)(new.Num) == nextVersion {
+				utils.DPrintf("[sahrdctrler] ChangeConfigTo: next config version %v equals new config version %v. Both current and next config are in sync. Noting to do. Returning.", nextVersion, new.Num)
+
+				return
+			}
+
+			err := sck.handleSameVersions(shardcfg.FromString(value), new)
 			if err != rpc.OK {
-				utils.DPrintf("[schrdctrler] InitController: failed to handle same versions, err = %v, retrying", err)
+				utils.DPrintf("[schrdctrler] ChangeConfigTo: failed to handle same versions, err = %v, retrying", err)
 				continue
 			}
 
 			return
 		}
 
-		if curVersion != nextVersion {
-			utils.DPrintf("[schrdctrler] InitController: current and next config found, but versions are different, recovering by transfering shards according to the next config and then set current config to next config")
-			err := sck.handleDifferentVersions(shardcfg.FromString(value), new, curVersion)
+		if curVersion == nextVersion-1 {
+			utils.DPrintf("[schrdctrler] ChangeConfigTo: current and next config found, but versions are different, recovering by transfering shards according to the next config and then set current config to next config")
+
+			err := sck.handleDifferentVersions(shardcfg.FromString(value), shardcfg.FromString(nextValue))
 			if err != rpc.OK {
-				utils.DPrintf("[schrdctrler] InitController: failed to handle different versions, err = %v, retrying", err)
+				utils.DPrintf("[schrdctrler] ChangeConfigTo: failed to handle different versions, err = %v, retrying", err)
 				continue
 			}
 
 			return
 		}
 
-		panic("InitController: unexpected case where current and next config versions are different but not covered by the previous cases, idk how to handle it yet")
+		if math.Abs(float64(curVersion-nextVersion)) > 1 {
+			panic(fmt.Sprintf("ChangeConfigTo: Corrupted state. Current: %v, Next: %v", curVersion, nextVersion))
+
+		}
+
+		panic(fmt.Sprintf("ChangeConfigTo: unexpected case where current and next config versions are different but not covered by the previous cases, idk how to handle it yet. Current: %v, Next: %v", curVersion, nextVersion))
 	}
 }
 
 func (sck *ShardCtrler) handleBothEmptyConfig(new *shardcfg.ShardConfig) rpc.Err {
-	err := sck.setCofnigValueByKey(NEXT_CONFIG_KEY, shardcfg.FromString(new.String()), INITIAL_CONFIG_VERSION)
+	newVersion := (rpc.Tversion)(new.Num - 1)
+
+	err := sck.setCofnigValueByKey(NEXT_CONFIG_KEY, new, newVersion)
 	if err != rpc.OK {
-		utils.DPrintf("[schrdctrler] InitController: failed to set next config value, err = %v, retrying", err)
+		utils.DPrintf("[schrdctrler][%s] handleBothEmptyConfig: failed to set next config value, err = %v, retrying", sck.me, err)
 		return err
 	}
-	err = sck.setCofnigValueByKey(CONFIG_KEY, shardcfg.FromString(new.String()), INITIAL_CONFIG_VERSION)
+
+	err = sck.setCofnigValueByKey(CONFIG_KEY, new, newVersion)
 	if err != rpc.OK {
-		utils.DPrintf("[schrdctrler] InitController: failed to set current config value, err = %v, retrying", err)
+		utils.DPrintf("[schrdctrler][%s] handleBothEmptyConfig: failed to set current config value, err = %v, retrying", sck.me, err)
 		return err
 	}
+
 	return rpc.OK
 }
 
 func (sck *ShardCtrler) handleNoCurrentNextExists(new *shardcfg.ShardConfig) rpc.Err {
-	err := sck.setCofnigValueByKey(CONFIG_KEY, new, INITIAL_CONFIG_VERSION)
+	newVersion := (rpc.Tversion)(new.Num - 1)
+
+	err := sck.setCofnigValueByKey(CONFIG_KEY, new, newVersion)
 	if err != rpc.OK {
-		utils.DPrintf("[schrdctrler] InitController: failed to set current config value, err = %v, retrying", err)
+		utils.DPrintf("[schrdctrler][%s] handleNoCurrentNextExists: failed to set current config value, err = %v, retrying", sck.me, err)
 		return err
 	}
 
 	return rpc.OK
 }
 
-func (sck *ShardCtrler) handleSameVersions(old, new *shardcfg.ShardConfig, curVersion, nextVersion rpc.Tversion) rpc.Err {
-	err := sck.setCofnigValueByKey(NEXT_CONFIG_KEY, new, nextVersion)
+func (sck *ShardCtrler) handleSameVersions(old, new *shardcfg.ShardConfig) rpc.Err {
+	version := (rpc.Tversion)(new.Num - 1)
+
+	err := sck.setCofnigValueByKey(NEXT_CONFIG_KEY, new, version)
 	if err != rpc.OK {
-		utils.DPrintf("[schrdctrler] InitController: failed to set next config value, err = %v, retrying", err)
+		utils.DPrintf("[schrdctrler][%s] handleSameVersions: failed to set next config value, err = %v, retrying", sck.me, err)
 		return err
 	}
+
 	err = sck.transferShards(old, new)
 	if err != rpc.OK {
-		utils.DPrintf("[schrdctrler] InitController: failed to transfer shards for new config, err = %v, retrying", err)
+		utils.DPrintf("[schrdctrler][%s] handleSameVersions: failed to transfer shards for new config, err = %v, retrying", sck.me, err)
 		return err
 	}
-	err = sck.setCofnigValueByKey(CONFIG_KEY, new, curVersion)
+
+	err = sck.setCofnigValueByKey(CONFIG_KEY, new, version)
 	if err != rpc.OK {
-		utils.DPrintf("[schrdctrler] InitController: failed to set current config value, err = %v, retrying", err)
+		utils.DPrintf("[schrdctrler][%s] handleSameVersions: failed to set current config value, err = %v, retrying", sck.me, err)
 		return err
 	}
 
 	return rpc.OK
 
 }
-func (sck *ShardCtrler) handleDifferentVersions(old, new *shardcfg.ShardConfig, curVersion rpc.Tversion) rpc.Err {
+func (sck *ShardCtrler) handleDifferentVersions(old, new *shardcfg.ShardConfig) rpc.Err {
+	newVersion := (rpc.Tversion)(new.Num - 1)
+	curVersion := newVersion
+
 	err := sck.transferShards(old, new)
 	if err != rpc.OK {
-		utils.DPrintf("[schrdctrler] InitController: failed to transfer shards for new config, err = %v, retrying", err)
+		utils.DPrintf("[schrdctrler][%s] handleDifferentVersions: failed to transfer shards for new config, err = %v, retrying", sck.me, err)
 		return err
 	}
+
 	err = sck.setCofnigValueByKey(CONFIG_KEY, new, curVersion)
 	if err != rpc.OK {
-		utils.DPrintf("[schrdctrler] InitController: failed to set current config value, err = %v, retrying", err)
+		utils.DPrintf("[schrdctrler][%s] handleDifferentVersions: failed to set current config value, err = %v, retrying", sck.me, err)
 		return err
 	}
 
@@ -210,14 +271,19 @@ func (sck *ShardCtrler) handleDifferentVersions(old, new *shardcfg.ShardConfig, 
 }
 
 func (sck *ShardCtrler) setCofnigValueByKey(key string, config *shardcfg.ShardConfig, version rpc.Tversion) rpc.Err {
+	if key == CONFIG_KEY {
+		sck.lastConfig.Store(config)
+		utils.DPrintf("[schrdctrler][%s] Updated last config in memory to %v", sck.me, sck.lastConfig.Load())
+	}
+
 	err := sck.tryPutValueWithRetires(key, config.String(), version)
 	if err == rpc.OK {
-		utils.DPrintf("[schrdctrler] Successfully put %s config with version %v", key, version)
+		utils.DPrintf("[schrdctrler][%s] Successfully put %s config with version %v", sck.me, key, version)
 
 		return err
 	}
 
-	utils.DPrintf("[schrdctrler] Failed to put %s config with version %v, err = %v, retrying", key, version, err)
+	utils.DPrintf("[schrdctrler][%s] Failed to put %s config with version %v, err = %v, retrying", sck.me, key, version, err)
 
 	return err
 }
@@ -339,7 +405,7 @@ func (sck *ShardCtrler) tryPutValueWithRetires(key, value string, version rpc.Tv
 		retries++
 	}
 
-	utils.DPrintf("[schrdctrler] tryPutValueWithRetires: done trying to put value %v with err %v after %d retries", value, err, retries)
+	utils.DPrintf("[schrdctrler][%s] tryPutValueWithRetires: done trying to put value %v with err %v after %d retries", sck.me, value, err, retries)
 
 	return err
 }
@@ -347,12 +413,45 @@ func (sck *ShardCtrler) tryPutValueWithRetires(key, value string, version rpc.Tv
 // Return the current configuration
 func (sck *ShardCtrler) Query() *shardcfg.ShardConfig {
 	// Your code here.
+
+	done := make(chan *shardcfg.ShardConfig, 1)
+	go func() {
+		done <- sck.loadConfigFromKvSrv()
+	}()
+
+	timer := time.NewTimer(50 * time.Millisecond)
+	defer timer.Stop()
+
+	for {
+		select {
+		case cfg := <-done:
+			if cfg != nil {
+				utils.DPrintf("[schrdctrler][%s] Query: got config from kvsrv: %v", sck.me, cfg)
+				return cfg
+			}
+
+			cfg = sck.lastConfig.Load()
+			utils.DPrintf("[schrdctrler][%s] Query: failed to get config from kvsrv, returning last config in memory: %v", sck.me, cfg)
+
+			return cfg
+		case <-timer.C:
+			cfg := sck.lastConfig.Load()
+			utils.DPrintf("[schrdctrler][%s] Query: timeout while getting config from kvsrv, returning last config in memory: %v", sck.me, cfg)
+
+			return cfg
+		}
+	}
+}
+
+func (sck *ShardCtrler) loadConfigFromKvSrv() *shardcfg.ShardConfig {
 	value, version, err := sck.Get(CONFIG_KEY)
-	utils.DPrintf("Query: get value %v version %v err %v", value, version, err)
+	utils.DPrintf("[schrdctrler][%s] loadConfigFromKvSrv: get value %v version %v err %v", sck.me, value, version, err)
 
 	if err == rpc.OK {
 		return shardcfg.FromString(value)
 	}
+
+	utils.DPrintf("[schrdctrler][%s] loadConfigFromKvSrv: failed to get config from kvsrv, returning nil", sck.me)
 
 	return nil
 }
