@@ -84,7 +84,6 @@ func (ck *Clerk) callFreezeShard(s int32, args *shardrpc.FreezeShardArgs, reply 
 	deadline := time.After(rpcTimeout * time.Second)
 	resChan := make(chan bool, 1)
 
-	// utils.DPrintf("Calling callFreezeShard for %v", args)
 
 	go func() {
 		ok := ck.clnt.Call(ck.servers[s], "KVServer.FreezeShard", args, reply)
@@ -163,8 +162,8 @@ func (ck *Clerk) sendReqToMaster(rpcCaller func(s int32) (NetworkReply, rpc.Err)
 				switch ntReply {
 				case OK:
 					err := ck.inferRPCCodeOnNetworkOK(currentLeader, int32(idx), hadLostCalls, rpcErr)
-					if err != nil {
-						return *err
+					if err != rpc.ErrWrongLeader {
+						return err
 					}
 				case TIMEOUT:
 					utils.DPrintf("[shardgrp/clerk] Timeout to server = %v", ck.servers[idx])
@@ -188,36 +187,30 @@ func (ck *Clerk) sendReqToMaster(rpcCaller func(s int32) (NetworkReply, rpc.Err)
 	return rpcErr
 }
 
-func (ck *Clerk) inferRPCCodeOnNetworkOK(currentLeader, newLeader int32, hadLostCalls bool, rpcErr rpc.Err) *rpc.Err {
-	var rpcErrToReturn rpc.Err
-
+func (ck *Clerk) inferRPCCodeOnNetworkOK(currentLeader, newLeader int32, hadLostCalls bool, rpcErr rpc.Err) rpc.Err {
 	switch rpcErr {
 	case rpc.OK:
 		ck.leader.CompareAndSwap(currentLeader, newLeader)
-		rpcErrToReturn = rpc.OK
+		return rpc.OK
 	case rpc.ErrVersion:
 		// the first call failed, we don't know if the Put was performed or not, return ErrMaybe
 		ck.leader.CompareAndSwap(currentLeader, newLeader)
 		if hadLostCalls {
-			rpcErrToReturn = rpc.ErrMaybe
+			return rpc.ErrMaybe
 		}
-		rpcErrToReturn = rpc.ErrVersion
+		return rpc.ErrVersion
 	case rpc.ErrWrongLeader:
 		// try the next server
-		// has to return nil and continue looking for the leader
-		utils.DPrintf("[shardgrp/clerk] Wrong leader after RPC OK, has to continue looking for the leader")
-		return nil
+		return rpc.ErrWrongLeader
 	case rpc.ErrWrongGroup:
 		if hadLostCalls {
-			rpcErrToReturn = rpc.ErrMaybe
+			return rpc.ErrMaybe
 		}
-		rpcErrToReturn = rpc.ErrWrongGroup
+		return rpc.ErrWrongGroup
 	default:
 		// some other error, return it
-		rpcErrToReturn = rpcErr
+		return rpcErr
 	}
-
-	return &rpcErrToReturn
 }
 
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
