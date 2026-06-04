@@ -176,7 +176,7 @@ func (ck *Clerk) sendReqToMaster(rpcCaller func(s int32) (NetworkReply, rpc.Err)
 					panic("Unknown NetworkReply")
 				}
 			}
-			
+
 			if partitions == len(ck.servers) {
 				utils.DPrintf("[shardgrp/clerk] All servers are partitioned, retrying")
 				return rpc.ErrMaybe
@@ -205,6 +205,8 @@ func (ck *Clerk) inferRPCCodeOnNetworkOK(currentLeader, newLeader int32, hadLost
 	case rpc.ErrWrongLeader:
 		// try the next server
 		// has to return nil and continue looking for the leader
+		utils.DPrintf("[shardgrp/clerk] Wrong leader after RPC OK, has to continue looking for the leader")
+		return nil
 	case rpc.ErrWrongGroup:
 		if hadLostCalls {
 			rpcErrToReturn = rpc.ErrMaybe
