@@ -76,6 +76,10 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 func (ck *Clerk) tryGetValue(shard shardcfg.Tshid, key string) (string, rpc.Tversion, rpc.Err) {
 	grpClerk := ck.getClerkForShard(shard)
 
+	if grpClerk == nil {
+		return "", 0, rpc.ErrWrongGroup
+	}
+
 	return grpClerk.Get(key)
 }
 
@@ -119,25 +123,33 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 func (ck *Clerk) tryPutValue(shard shardcfg.Tshid, key string, value string, version rpc.Tversion) rpc.Err {
 	grpClerk := ck.getClerkForShard(shard)
 
+	if grpClerk == nil {
+		return rpc.ErrWrongGroup
+	}
+
 	return grpClerk.Put(key, value, version)
 }
 
 func (ck *Clerk) getClerkForShard(shard shardcfg.Tshid) *shardgrp.Clerk {
 	cfg := ck.sck.Query()
+	utils.DPrintf("[getClerkForShard] Queried config: %v", cfg)
 	gid := cfg.Shards[shard]
 
 	ck.clerksLock.Lock()
+	defer ck.clerksLock.Unlock()
+
 	grpClerk, ok := ck.grpClerks[gid]
 	if !ok {
 		servers, ok := cfg.Groups[gid]
 		if !ok {
-			panic("no group for shard")
+			utils.DPrintf("[getClerkForShard] No group found for gid %v, shard %v", gid, shard)
+
+			return nil
 		}
 
 		grpClerk = shardgrp.MakeClerk(ck.clnt, servers)
 		ck.grpClerks[gid] = grpClerk
 	}
-	ck.clerksLock.Unlock()
 
 	return grpClerk
 }
