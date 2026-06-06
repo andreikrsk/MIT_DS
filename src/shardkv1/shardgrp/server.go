@@ -1,6 +1,5 @@
 package shardgrp
 
-// TestManyConcurrentClerkUnreliable5A
 
 import (
 	"bytes"
@@ -90,7 +89,6 @@ func (kv *KVServer) handleGetOp(args *rpc.GetArgs) GetOpResult {
 	utils.DPrintf("[server=%d, gid=%d, handleGetOp: shard=%d] key=%v is on shard=%d",
 		kv.me, kv.gid, kv.lastSeenConfigNum, args.Key, shId)
 
-
 	db, err := kv.getShardDb(shId)
 	if err != rpc.OK {
 		utils.DPrintf("[server=%d, gid=%d, handleGetOp: shard=%d] key=%v is on shard=%d. The group is not the owner of the shard.",
@@ -174,7 +172,6 @@ func (kv *KVServer) handleFreezeShardOp(args *shardrpc.FreezeShardArgs) FreezeSh
 	if args.Num < kv.lastSeenConfigNum[args.Shard] {
 		return FreezeShardOpResult{Err: rpc.OK}
 	}
-	kv.lastSeenConfigNum[args.Shard] = args.Num
 
 	// if no db, probably no op, just continue
 	db, err := kv.getShardDb(args.Shard)
@@ -184,6 +181,8 @@ func (kv *KVServer) handleFreezeShardOp(args *shardrpc.FreezeShardArgs) FreezeSh
 	}
 
 	kv.frozenShards[args.Shard] = struct{}{}
+
+	kv.lastSeenConfigNum[args.Shard] = args.Num
 
 	utils.DPrintf("[server=%d, gid=%d, handleFreezeShardOp: shard=%d, num=%d, lastSeenConfigNum=%d]. Returning state %v",
 		kv.me, kv.gid, args.Shard, args.Num, kv.lastSeenConfigNum, db)
@@ -212,19 +211,18 @@ func (kv *KVServer) handleInstallShardOp(args *shardrpc.InstallShardArgs) Instal
 		kv.me, kv.gid, args.Shard, args.Num, kv.lastSeenConfigNum, db)
 
 	// verify leniariz for the shard. if outdated -> OK
-	// it should be impossible to install a shard for the Num twice
 	if args.Num <= kv.lastSeenConfigNum[args.Shard] {
 		// panic("Received FreezeShard request with old config num, idk how to handle it yet")
 		utils.DPrintf("[server=%d, gid=%d, handleInstallShardOp: shard=%d, num=%d, lastSeenConfigNum=%d] returning no op",
 			kv.me, kv.gid, args.Shard, args.Num, kv.lastSeenConfigNum)
 		return InstallShardOpResult{Err: rpc.OK}
 	}
-	kv.lastSeenConfigNum[args.Shard] = args.Num
-
 	kv.db[args.Shard] = db
 
 	// unfroze if some stale operation have not complete the process and the shard is frozen
 	delete(kv.frozenShards, args.Shard)
+
+	kv.lastSeenConfigNum[args.Shard] = args.Num
 
 	utils.DPrintf("[server=%d, gid=%d, handleInstallShardOp: shard=%d, num=%d, lastSeenConfigNum=%d] returning",
 		kv.me, kv.gid, args.Shard, args.Num, kv.lastSeenConfigNum)
@@ -246,11 +244,11 @@ func (kv *KVServer) handleDeleteShardOp(args *shardrpc.DeleteShardArgs) DeleteSh
 		}
 	}
 
-	// update version
-	kv.lastSeenConfigNum[args.Shard] = args.Num
-
 	delete(kv.db, args.Shard)
 	delete(kv.frozenShards, args.Shard)
+
+	// update version
+	kv.lastSeenConfigNum[args.Shard] = args.Num
 
 	return DeleteShardOpResult{
 		Err: rpc.OK,
